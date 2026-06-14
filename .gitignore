@@ -1,0 +1,287 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distributions / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+venv*/
+*env/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.pycharm_helpers/
+.pydevproject
+.project
+.classpath
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+*.pynb
+*.nbconvert
+*.nbdata
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+*.env
+.envrc
+
+# Database files (vector databases)
+*.db
+*.duckdb
+*.duckdb.wal
+chroma/
+chroma_db/
+qdrant/
+weaviate/
+pinecone/
+milvus/
+*.faiss
+*.hnsw
+*.index
+*.bin
+*.ann
+
+# Vector embeddings cache
+embeddings/
+.embeddings_cache/
+*.embedding
+*.embeddings
+*.vec
+
+# Document processing
+*.txt.chunks
+*.chunks.pkl
+*.processed.pkl
+*.converted.pdf
+*.converted.docx
+
+# Vector stores (local)
+vectorstore/
+vector_stores/
+vectordb/
+vector_db/
+*.vectordb
+persistent_db/
+
+# LLM / model files (often large)
+*.pt
+*.pth
+*.bin
+*.gguf
+*.ggml
+*.onnx
+*.h5
+*.hdf5
+*.pb
+*.caffemodel
+*.pkl
+*.joblib
+*.keras
+*.model
+models/
+*.pkl
+*.pickle
+
+# Cache directories
+.cache/
+.cache_pytest/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+.mypy_cache/
+
+# Logs
+logs/
+*.log
+log.txt
+logging.log
+*.log.*
+
+# Data files (raw data can be large)
+data/
+raw_data/
+processed_data/
+datasets/
+*.parquet
+*.arrow
+*.orc
+*.csv
+*.xlsx
+*.xls
+*.jsonl
+*.json
+*.xml
+
+# Uploaded user files
+uploads/
+user_data/
+documents/
+temp_uploads/
+*.upload
+*.tmp
+
+# Outputs
+outputs/
+results/
+generated/
+*.output
+*.result
+
+# API keys / secrets
+*.key
+*.pem
+*.crt
+*.cer
+*.p12
+secrets/
+keys/
+credentials.json
+service-account.json
+*.secret
+
+# Docker
+docker-compose.override.yml
+docker-compose.*.yml
+docker-compose.*.yaml
+.dockerignore
+Dockerfile.*
+*.dockerfile
+
+# Airflow specific
+airflow.cfg
+airflow.db
+webserver_config.py
+logs/
+airflow/logs/
+airflow/airflow.db
+airflow/webserver_config.py
+airflow-scheduler.pid
+airflow-webserver.pid
+*.pid
+
+# Hugging Face cache
+.huggingface/
+hf_cache/
+models--*/  # Downloads models locally
+
+# LangChain cache
+.langchain/
+.langchain_cache/
+
+# LlamaIndex cache
+.llama_index/
+llama_index_cache/
+
+# Streamlit
+.streamlit/secrets.toml
+.streamlit/config.toml
+.streamlit/*.db
+
+# Gradio
+gradio_cached_examples/
+gradio/
+
+# FastAPI / Uvicorn
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Testing
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+test_results/
+test-reports/
+
+# mkdocs documentation
+site/
+.mkdocs-cache/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# pytype
+.pytype/
+
+# Profiling data
+.prof
+*.prof
+*.lprof
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.bak
+*.swp
+*.swo
+*~
+._*
+
+# Backup files
+*.backup
+*.old
+*.orig
+*.rej
+
+# Local development overrides
+*.local.py
+*.local.yaml
+*.local.yml
+config.local.*
+settings.local.*
+.env

@@ -1,0 +1,38 @@
+# Prometheus configuration for RAG pipeline monitoring
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: 'rag-pipeline-monitor'
+
+# Scrape configurations
+scrape_configs:
+  # Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Pushgateway for batch job metrics
+  - job_name: 'pushgateway'
+    honor_labels: true
+    static_configs:
+      - targets: ['prometheus-pushgateway:9091']
+
+  # Airflow metrics (if exposed)
+  - job_name: 'airflow'
+    static_configs:
+      - targets: ['airflow-webserver:8080']
+    metrics_path: '/admin/metrics'
+
+  # Qdrant metrics
+  - job_name: 'qdrant'
+    static_configs:
+      - targets: ['qdrant:6333']
+    metrics_path: '/metrics'
+
+# Alerting rules (optional)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ['alertmanager:9093']

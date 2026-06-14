@@ -1,0 +1,25 @@
+[tool.black]
+line-length = 120
+target-version = ["py311"]
+skip-string-normalization = false
+
+[tool.isort]
+profile = "black"
+line_length = 120
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_return_any = false
+no_implicit_optional = true
+check_untyped_defs = false
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-v --tb=short --disable-warnings --strict-markers"
+testpaths = ["tests"]

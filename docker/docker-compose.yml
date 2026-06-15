@@ -1,15 +1,36 @@
 name: rag-pipeline
 
-x-airflow-common:
-  &airflow-common
+# ═══════════════════════════════════════════════════════════════════════════════
+# ONE IMAGE — built once as "rag-pipeline:latest", shared by all 4 custom
+# services (webserver, scheduler, init, streamlit).
+#
+# Before: docker images showed 4 × 11 GB = 44 GB "virtual"
+# After:  docker images shows 1 × 11 GB
+#
+# Note: Docker already de-duplicates identical layers on disk, so the REAL
+# disk saving is not 33 GB — layers were shared before too.  The gains are:
+#   ✅ `docker images` shows ONE entry instead of four
+#   ✅ `docker compose build` runs exactly once (guaranteed, not just cached)
+#   ✅ No risk of services running from slightly different image versions
+# ═══════════════════════════════════════════════════════════════════════════════
+
+x-rag-image: &rag-image
+  image: rag-pipeline:latest          # all 4 services share this single tag
+  pull_policy: never  
   build:
     context: ..
     dockerfile: docker/Dockerfile
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Airflow defaults — inherited by webserver / scheduler / init / streamlit
+# ───────────────────────────────────────────────────────────────────────────────
+x-airflow-common: &airflow-common
+  <<: *rag-image                      # pulls in image + build from above
   env_file:
-    - ../.env                          # ← auto-load .env so --env-file not needed
-  environment:
-    &airflow-common-env
+    - ../.env
+  environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    PYTHONPATH: /opt/airflow/dags
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
     AIRFLOW__CORE__FERNET_KEY: ''
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
@@ -26,7 +47,7 @@ x-airflow-common:
     AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
     AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
     AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
-    # Embedding — free HuggingFace model (no OpenAI key needed)
+    # Free HuggingFace embeddings — no OpenAI key needed
     RAG_EMBEDDING_MODEL: ${RAG_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
     # Metadata DB
     RAG_METADATA_DB_HOST: postgres
@@ -34,7 +55,6 @@ x-airflow-common:
     RAG_METADATA_DB_NAME: rag_metadata
     RAG_METADATA_DB_USER: airflow
     RAG_METADATA_DB_PASSWORD: airflow
-
   volumes:
     - ../dags:/opt/airflow/dags
     - ../data:/opt/airflow/data
@@ -42,8 +62,7 @@ x-airflow-common:
     - ../plugins:/opt/airflow/plugins
     - airflow-worker-logs:/opt/airflow/logs
   user: "${AIRFLOW_UID:-50000}:0"
-  depends_on:
-    &airflow-common-depends-on
+  depends_on: &airflow-common-depends-on
     redis:
       condition: service_healthy
     postgres:
@@ -51,7 +70,12 @@ x-airflow-common:
     qdrant:
       condition: service_healthy
 
+# ───────────────────────────────────────────────────────────────────────────────
+# Services
+# ───────────────────────────────────────────────────────────────────────────────
 services:
+
+  # ─── Infrastructure (external images, unchanged) ────────────────────────────
 
   postgres:
     image: postgres:15
@@ -84,7 +108,6 @@ services:
     volumes:
       - redis-data:/data
 
-  # FIX: healthcheck uses bash /dev/tcp — curl not installed in qdrant image
   qdrant:
     image: qdrant/qdrant:v1.7.4
     ports:
@@ -95,6 +118,7 @@ services:
     environment:
       QDRANT__SERVICE__GRPC_PORT: 6334
     healthcheck:
+      # curl is not installed in qdrant; use bash tcp probe instead
       test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333' 2>/dev/null && echo ok || exit 1"]
       interval: 5s
       timeout: 5s
@@ -102,7 +126,6 @@ services:
       start_period: 30s
     restart: always
 
-  # Depends on airflow-init so 'mlflow' DB is created first
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.10.2
     ports:
@@ -122,7 +145,7 @@ services:
       postgres:
         condition: service_healthy
       airflow-init:
-        condition: service_completed_successfully
+        condition: service_completed_successfully  # wait for mlflow DB to be created
     restart: always
 
   prometheus:
@@ -162,62 +185,8 @@ services:
       - prometheus
     restart: always
 
-  streamlit:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    entrypoint: [""] 
-    command: streamlit run /opt/airflow/streamlit_app/app.py --server.port=8501 --server.address=0.0.0.0
-    ports:
-      - "8501:8501"
-    env_file:
-      - ../.env
-    environment:
-      QDRANT_HOST: qdrant
-      QDRANT_PORT: 6333
-      RAG_EMBEDDING_MODEL: ${RAG_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
-    volumes:
-      - ../streamlit_app:/opt/airflow/streamlit_app
-      - ../dags:/opt/airflow/dags
-    depends_on:
-      - qdrant
-    restart: always
+  # ─── RAG application — all 4 containers run from rag-pipeline:latest ────────
 
-  airflow-webserver:
-    <<: *airflow-common
-    command: webserver
-    ports:
-      - "8080:8080"
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
-    restart: always
-    depends_on:
-      <<: *airflow-common-depends-on
-      airflow-init:
-        condition: service_completed_successfully
-
-  airflow-scheduler:
-    <<: *airflow-common
-    command: scheduler
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
-    restart: always
-    depends_on:
-      <<: *airflow-common-depends-on
-      airflow-init:
-        condition: service_completed_successfully
-
-  # FIX 1: PYTHONPATH so root user can find psycopg2 (installed for airflow user)
-  # FIX 2: qdrant uses service_started (init doesn't need qdrant healthy)
-  # FIX 3: DB creation runs BEFORE exec (exec replaces the shell process)
   airflow-init:
     <<: *airflow-common
     entrypoint: /bin/bash
@@ -287,7 +256,58 @@ services:
       redis:
         condition: service_healthy
       qdrant:
-        condition: service_started   # init doesn't use qdrant
+        condition: service_started   # init doesn't query qdrant, just needs it up
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Streamlit: same image — entrypoint cleared so "streamlit" is not wrapped
+  # by the Airflow entrypoint script as "airflow streamlit" (which would crash)
+  streamlit:
+    <<: *airflow-common
+    entrypoint: [""]                  # ← override Airflow entrypoint
+    command: >
+      streamlit run /opt/airflow/streamlit_app/app.py
+      --server.port=8501
+      --server.address=0.0.0.0
+    ports:
+      - "8501:8501"
+    volumes:                          # override: only what streamlit needs
+      - ../streamlit_app:/opt/airflow/streamlit_app
+      - ../dags:/opt/airflow/dags
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    restart: always
 
 volumes:
   postgres-db-volume:

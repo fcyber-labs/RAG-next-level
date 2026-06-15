@@ -37,7 +37,7 @@ def rewrite_query_with_llm(query: str, max_variations: int = 3) -> List[str]:
         #client = OpenAI()
         #response = client.chat.completions.create(
         response = client.chat.completions.create(
-            model='llama3-8b-8192',
+            model='openai/gpt-oss-120b', # llama3-8b-8192
             #model='gpt-3.5-turbo',
             messages=[
                 {

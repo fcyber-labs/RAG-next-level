@@ -3,10 +3,11 @@
 name: RAG Pipeline - Continuous Integration
 
 on:
-  push:
-    branches: [ main, develop ]
-  pull_request:
-    branches: [ main, develop ]
+  workflow_dispatch: 
+  #push:
+  #  branches: [ main, develop ]
+  #pull_request:
+  #  branches: [ main, develop ]
 
 env:
   PYTHON_VERSION: '3.11'

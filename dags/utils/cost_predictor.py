@@ -9,7 +9,6 @@ from typing import Any, Dict, List
 import numpy as np
 import requests
 from datetime import datetime
-from sklearn.linear_model import LinearRegression
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +24,10 @@ def predict_monthly_cost(
             "confidence": "low",
             "message": "Insufficient historical data",
         }
+
+    # Lazy import — sklearn pulls in scipy, which is heavy to import.
+    # Keeping it out of module-level code keeps Airflow's DagBag parse fast.
+    from sklearn.linear_model import LinearRegression
 
     timestamps = np.array([p["timestamp"] for p in historical_costs]).reshape(-1, 1)
     costs      = np.array([p["cost"]      for p in historical_costs])

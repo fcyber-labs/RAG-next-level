@@ -2,8 +2,8 @@
 
 name: RAG Pipeline - Continuous Integration
 
-on:
-  workflow_dispatch: 
+on: workflow_dispatch
+
   #push:
   #  branches: [ main, develop ]
   #pull_request:

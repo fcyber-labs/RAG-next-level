@@ -274,8 +274,14 @@ def extract_sources(
     logger.info(f"Starting document extraction from sources: {sources}")
     
     if 's3' in sources and s3_bucket:
-        s3_docs = extract_from_s3(bucket=s3_bucket, prefix=s3_prefix)
-        all_documents.extend(s3_docs)
+        try:
+            s3_docs = extract_from_s3(bucket=s3_bucket, prefix=s3_prefix)
+            all_documents.extend(s3_docs)
+        except Exception as e:
+            # Don't let a missing/misconfigured S3 source crash the whole
+            # extraction stage — log and continue with the other sources,
+            # the same way extract_from_filesystem / extract_from_urls do.
+            logger.warning(f"Skipping S3 source due to error: {e}")
     
     if 'filesystem' in sources and filesystem_path:
         fs_docs = extract_from_filesystem(path=filesystem_path)

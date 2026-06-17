@@ -70,7 +70,7 @@ dag = DAG(
         'chunk_overlap': 50,
         'embedding_model': os.getenv('RAG_EMBEDDING_MODEL', 'sentence-transformers/all-MiniLM-L6-v2'),
         'eval_threshold': 0.75,
-        'sources': ['s3', 'filesystem', 'urls'],
+        'sources': ['filesystem', 'urls'],
         'use_hybrid_search': True,
         'use_query_rewriting': True,
         'use_reranking': True,
@@ -121,7 +121,7 @@ with dag:
                 's3_bucket': "{{ var.value.get('rag_s3_bucket', 'company-docs') }}",
                 's3_prefix': "{{ var.value.get('rag_s3_prefix', 'knowledge-base/') }}",
                 'url_list_path': '/opt/airflow/data/urls_to_scrape.txt',
-                'filesystem_path': '/opt/airflow/data/documents',
+                'filesystem_path': '/opt/airflow/data',
             },
         )
 

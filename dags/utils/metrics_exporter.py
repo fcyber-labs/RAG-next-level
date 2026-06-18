@@ -70,6 +70,54 @@ dedup_cache_hit_rate = Gauge(
     registry=registry
 )
 
+eval_recall_at_1 = Gauge(
+    'rag_eval_recall_at_1',
+    'Recall@1 score from evaluation',
+    registry=registry
+)
+
+eval_recall_at_10 = Gauge(
+    'rag_eval_recall_at_10',
+    'Recall@10 score from evaluation',
+    registry=registry
+)
+
+expired_docs_removed = Gauge(
+    'rag_expired_docs_removed',
+    'Number of expired documents removed in last run',
+    registry=registry
+)
+
+collection_total_points = Gauge(
+    'rag_collection_total_points',
+    'Total points in Qdrant collection after upsert',
+    registry=registry
+)
+
+hybrid_search_bm25_weight = Gauge(
+    'rag_hybrid_search_bm25_weight',
+    'BM25 weight used in hybrid search',
+    registry=registry
+)
+
+collection_promotions_counter = Counter(
+    'rag_collection_promotions_total',
+    'Total number of successful collection promotions',
+    registry=registry
+)
+
+collection_promotion_failures_counter = Counter(
+    'rag_collection_promotion_failures_total',
+    'Total number of failed collection promotions',
+    registry=registry
+)
+
+reranker_score_histogram = Histogram(
+    'rag_reranker_score_improvement',
+    'Score improvement from reranking',
+    registry=registry
+)
+
 
 def export_counter(metric_name: str, value: float):
     """
@@ -87,6 +135,8 @@ def export_counter(metric_name: str, value: float):
             'chunks_created_total': chunks_counter,
             'chunks_embedded_total': embeddings_counter,
             'vectors_upserted_total': vectors_counter,
+            'collection_promotions_total': collection_promotions_counter,
+            'collection_promotion_failures_total': collection_promotion_failures_counter,
         }
         
         counter = metric_map.get(metric_name)
@@ -110,9 +160,13 @@ def export_gauge(metric_name: str, value: float):
         # Map metric names to actual gauge objects
         metric_map = {
             'eval_recall_at_5': eval_recall_at_5,
-            'eval_recall_at_1': eval_recall_at_5,  # Reuse for simplicity
+            'eval_recall_at_1': eval_recall_at_1,
+            'eval_recall_at_10': eval_recall_at_10,
             'eval_mrr': eval_mrr,
             'deduplication_cache_hit_rate': dedup_cache_hit_rate,
+            'expired_docs_removed_gauge': expired_docs_removed,
+            'collection_total_points': collection_total_points,
+            'hybrid_search_bm25_weight': hybrid_search_bm25_weight,
         }
         
         gauge = metric_map.get(metric_name)
@@ -137,6 +191,7 @@ def export_histogram(metric_name: str, value: float):
         metric_map = {
             'embedding_latency_seconds': embedding_latency,
             'upsert_latency_seconds': upsert_latency,
+            'reranker_score_improvement': reranker_score_histogram,
         }
         
         histogram = metric_map.get(metric_name)

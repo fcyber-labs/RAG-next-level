@@ -135,12 +135,15 @@ services:
       MLFLOW_ARTIFACT_ROOT: /mlflow/artifacts
     volumes:
       - mlflow-artifacts:/mlflow/artifacts
+    # psycopg2-binary is not included in the official MLflow image; install it
+    # at container start before launching the server.
     command: >
+      bash -c "pip install --quiet psycopg2-binary &&
       mlflow server
       --backend-store-uri postgresql://airflow:airflow@postgres/mlflow
       --default-artifact-root /mlflow/artifacts
       --host 0.0.0.0
-      --port 5000
+      --port 5000"
     depends_on:
       postgres:
         condition: service_healthy

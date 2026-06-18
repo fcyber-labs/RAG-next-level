@@ -46,9 +46,8 @@ def create_collection_if_not_exists(
             client.get_collection(collection_name)
             logger.info(f"Collection '{collection_name}' already exists")
             return
-        except Exception as e:
-            logger.error(f"Evaluation failed: {e}")
-            pass
+        except Exception:
+            logger.info(f"Collection '{collection_name}' not found, creating it...")
         
         # Create collection
         client.create_collection(

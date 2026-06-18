@@ -72,7 +72,8 @@ def upsert_to_qdrant(
     # Handle XCom input
     if isinstance(embedded_chunks, str):
         try:
-            embedded_chunks = eval(embedded_chunks)
+            import ast
+            embedded_chunks = ast.literal_eval(embedded_chunks)
         except Exception as e:
             logger.error(f"Could not parse embedded_chunks from XCom: {e}")
             return {'success': False, 'points_upserted': 0}

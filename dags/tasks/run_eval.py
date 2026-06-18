@@ -175,8 +175,25 @@ def run_retrieval_evaluation(
     logger.info(f"Starting retrieval evaluation on collection '{collection_name}'")
     logger.info(f"Hybrid search: {use_hybrid_search}, Reranking: {use_reranking}")
     
-    # Step 0: Filter expired documents
     client = _get_qdrant_client()
+
+    # Step 0: Verify collection exists before doing anything else.
+    # The upsert task runs before this task, so a missing collection means
+    # the upstream task failed or was skipped — fail fast with a clear message.
+    try:
+        client.get_collection(collection_name)
+    except Exception as e:
+        logger.error(
+            f"Collection '{collection_name}' does not exist in Qdrant. "
+            f"Ensure the upsert_vectors task completed successfully before "
+            f"running retrieval evaluation. Original error: {e}"
+        )
+        raise RuntimeError(
+            f"Collection '{collection_name}' not found in Qdrant. "
+            "Cannot run evaluation on a missing collection."
+        ) from e
+
+    # Step 1: Filter expired documents (safe — collection is confirmed to exist)
     expired_count = _filter_expired_documents(client, collection_name)
     
     # Load benchmark queries
@@ -317,8 +334,8 @@ def run_retrieval_evaluation(
     export_gauge('eval_recall_at_5', avg_recall_at_5)
     export_gauge('eval_recall_at_10', avg_recall_at_10)
     export_gauge('eval_mrr', avg_mrr)
-    export_histogram('eval_query_latency_seconds', avg_latency)
-    export_gauge('expired_docs_removed', expired_count)
+    export_histogram('upsert_latency_seconds', avg_latency)   # reuse registered histogram
+    export_gauge('expired_docs_removed_gauge', expired_count)
     
     # Log to MLflow
     try:

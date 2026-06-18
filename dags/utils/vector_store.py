@@ -46,8 +46,11 @@ def create_collection_if_not_exists(
             client.get_collection(collection_name)
             logger.info(f"Collection '{collection_name}' already exists")
             return
-        except Exception:
-            logger.info(f"Collection '{collection_name}' not found, creating it...")
+        except Exception as e:
+            # This is the normal "collection doesn't exist yet" path (Qdrant
+            # raises a 404 here), not an evaluation failure — log it as such
+            # so it doesn't get mistaken for a real error during debugging.
+            logger.info(f"Collection '{collection_name}' does not exist yet ({e}); creating it")
         
         # Create collection
         client.create_collection(

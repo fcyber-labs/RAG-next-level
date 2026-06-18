@@ -46,8 +46,12 @@ default_args = {
 }
 
 def init_ingestion_log(**context):
+    # `context['run_id']` is only populated in some Airflow versions —
+    # `context['dag_run'].run_id` is the reliable source across versions.
+    dag_run = context.get('dag_run')
+    run_id = dag_run.run_id if dag_run is not None else context.get('run_id', 'unknown')
     log_id = log_ingestion_start(
-        run_id=context['run_id'],
+        run_id=run_id,
         dag_id=context['dag'].dag_id,
         execution_date=context['ts'],
     )

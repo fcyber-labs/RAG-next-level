@@ -15,10 +15,23 @@ PUSHGATEWAY_URL = os.getenv('PROMETHEUS_PUSHGATEWAY', 'prometheus-pushgateway:90
 # Create a registry for this pipeline
 registry = CollectorRegistry()
 
-# Define metrics
+# ─── Counters ──────────────────────────────────────────────────────────────
+
+documents_extracted_counter = Counter(
+    'rag_documents_extracted_total',
+    'Total number of raw documents pulled from sources (before deduplication)',
+    registry=registry
+)
+
 documents_counter = Counter(
     'rag_documents_processed_total',
-    'Total number of documents processed',
+    'Total number of new (non-duplicate) documents processed',
+    registry=registry
+)
+
+documents_skipped_counter = Counter(
+    'rag_documents_deduplicated_skipped_total',
+    'Total number of documents skipped because they were already seen (duplicates)',
     registry=registry
 )
 
@@ -40,6 +53,32 @@ vectors_counter = Counter(
     registry=registry
 )
 
+query_rewrites_counter = Counter(
+    'rag_query_rewrites_total',
+    'Total number of queries rewritten by the query-rewriting stage',
+    registry=registry
+)
+
+collection_promotions_counter = Counter(
+    'rag_collection_promotions_total',
+    'Total number of successful staging -> production collection promotions',
+    registry=registry
+)
+
+collection_promotion_failures_counter = Counter(
+    'rag_collection_promotion_failures_total',
+    'Total number of failed staging -> production collection promotions',
+    registry=registry
+)
+
+embedding_cost_counter = Counter(
+    'rag_embedding_cost_usd_total',
+    'Estimated cumulative cost (USD) of OpenAI embedding calls',
+    registry=registry
+)
+
+# ─── Histograms ────────────────────────────────────────────────────────────
+
 embedding_latency = Histogram(
     'rag_embedding_latency_seconds',
     'Time spent generating embeddings',
@@ -52,27 +91,30 @@ upsert_latency = Histogram(
     registry=registry
 )
 
-eval_recall_at_5 = Gauge(
-    'rag_eval_recall_at_5',
-    'Recall@5 score from evaluation',
+eval_query_latency = Histogram(
+    'rag_eval_query_latency_seconds',
+    'Average per-query latency observed during retrieval evaluation',
     registry=registry
 )
 
-eval_mrr = Gauge(
-    'rag_eval_mrr',
-    'Mean Reciprocal Rank from evaluation',
+reranker_score_improvement = Histogram(
+    'rag_reranker_score_improvement',
+    'Change in the top result score after reranking (reranked_score - original_score)',
+    buckets=(-1.0, -0.5, -0.25, -0.1, -0.05, 0.0, 0.05, 0.1, 0.25, 0.5, 1.0, float('inf')),
     registry=registry
 )
 
-dedup_cache_hit_rate = Gauge(
-    'rag_dedup_cache_hit_rate',
-    'Deduplication cache hit rate',
-    registry=registry
-)
+# ─── Gauges ────────────────────────────────────────────────────────────────
 
 eval_recall_at_1 = Gauge(
     'rag_eval_recall_at_1',
     'Recall@1 score from evaluation',
+    registry=registry
+)
+
+eval_recall_at_5 = Gauge(
+    'rag_eval_recall_at_5',
+    'Recall@5 score from evaluation',
     registry=registry
 )
 
@@ -82,39 +124,39 @@ eval_recall_at_10 = Gauge(
     registry=registry
 )
 
-expired_docs_removed = Gauge(
+eval_mrr = Gauge(
+    'rag_eval_mrr',
+    'Mean Reciprocal Rank from evaluation',
+    registry=registry
+)
+
+expired_docs_removed_gauge = Gauge(
     'rag_expired_docs_removed',
-    'Number of expired documents removed in last run',
+    'Number of expired documents removed during the last evaluation run',
     registry=registry
 )
 
-collection_total_points = Gauge(
+dedup_cache_hit_rate = Gauge(
+    'rag_dedup_cache_hit_rate',
+    'Deduplication cache hit rate',
+    registry=registry
+)
+
+collection_total_points_gauge = Gauge(
     'rag_collection_total_points',
-    'Total points in Qdrant collection after upsert',
+    'Total number of points currently stored in the target collection',
     registry=registry
 )
 
-hybrid_search_bm25_weight = Gauge(
+hybrid_search_bm25_weight_gauge = Gauge(
     'rag_hybrid_search_bm25_weight',
-    'BM25 weight used in hybrid search',
+    'BM25 weight used in the most recent hybrid search call',
     registry=registry
 )
 
-collection_promotions_counter = Counter(
-    'rag_collection_promotions_total',
-    'Total number of successful collection promotions',
-    registry=registry
-)
-
-collection_promotion_failures_counter = Counter(
-    'rag_collection_promotion_failures_total',
-    'Total number of failed collection promotions',
-    registry=registry
-)
-
-reranker_score_histogram = Histogram(
-    'rag_reranker_score_improvement',
-    'Score improvement from reranking',
+average_chunks_per_document_gauge = Gauge(
+    'rag_average_chunks_per_document',
+    'Average number of chunks produced per document in the last chunking run',
     registry=registry
 )
 
@@ -130,19 +172,24 @@ def export_counter(metric_name: str, value: float):
     try:
         # Map metric names to actual counter objects
         metric_map = {
-            'documents_extracted_total': documents_counter,
+            'documents_extracted_total': documents_extracted_counter,
             'documents_deduplicated_new': documents_counter,
+            'documents_deduplicated_skipped': documents_skipped_counter,
             'chunks_created_total': chunks_counter,
             'chunks_embedded_total': embeddings_counter,
             'vectors_upserted_total': vectors_counter,
+            'query_rewrites_total': query_rewrites_counter,
             'collection_promotions_total': collection_promotions_counter,
             'collection_promotion_failures_total': collection_promotion_failures_counter,
+            'embedding_cost_usd': embedding_cost_counter,
         }
         
         counter = metric_map.get(metric_name)
         if counter:
             counter.inc(value)
             logger.debug(f"Incremented counter {metric_name} by {value}")
+        else:
+            logger.warning(f"Unknown counter metric name '{metric_name}' — value not exported")
     
     except Exception as e:
         logger.error(f"Error exporting counter {metric_name}: {e}")
@@ -159,20 +206,23 @@ def export_gauge(metric_name: str, value: float):
     try:
         # Map metric names to actual gauge objects
         metric_map = {
-            'eval_recall_at_5': eval_recall_at_5,
             'eval_recall_at_1': eval_recall_at_1,
+            'eval_recall_at_5': eval_recall_at_5,
             'eval_recall_at_10': eval_recall_at_10,
             'eval_mrr': eval_mrr,
+            'expired_docs_removed': expired_docs_removed_gauge,
             'deduplication_cache_hit_rate': dedup_cache_hit_rate,
-            'expired_docs_removed_gauge': expired_docs_removed,
-            'collection_total_points': collection_total_points,
-            'hybrid_search_bm25_weight': hybrid_search_bm25_weight,
+            'collection_total_points': collection_total_points_gauge,
+            'hybrid_search_bm25_weight': hybrid_search_bm25_weight_gauge,
+            'average_chunks_per_document': average_chunks_per_document_gauge,
         }
         
         gauge = metric_map.get(metric_name)
         if gauge:
             gauge.set(value)
             logger.debug(f"Set gauge {metric_name} to {value}")
+        else:
+            logger.warning(f"Unknown gauge metric name '{metric_name}' — value not exported")
     
     except Exception as e:
         logger.error(f"Error exporting gauge {metric_name}: {e}")
@@ -191,13 +241,16 @@ def export_histogram(metric_name: str, value: float):
         metric_map = {
             'embedding_latency_seconds': embedding_latency,
             'upsert_latency_seconds': upsert_latency,
-            'reranker_score_improvement': reranker_score_histogram,
+            'eval_query_latency_seconds': eval_query_latency,
+            'reranker_score_improvement': reranker_score_improvement,
         }
         
         histogram = metric_map.get(metric_name)
         if histogram:
             histogram.observe(value)
             logger.debug(f"Observed {value} for histogram {metric_name}")
+        else:
+            logger.warning(f"Unknown histogram metric name '{metric_name}' — value not exported")
     
     except Exception as e:
         logger.error(f"Error exporting histogram {metric_name}: {e}")

@@ -135,10 +135,8 @@ services:
       MLFLOW_ARTIFACT_ROOT: /mlflow/artifacts
     volumes:
       - mlflow-artifacts:/mlflow/artifacts
-    # psycopg2-binary is not included in the official MLflow image; install it
-    # at container start before launching the server.
     command: >
-      bash -c "pip install --quiet psycopg2-binary &&
+      bash -c "pip install --no-cache-dir psycopg2-binary==2.9.9 &&
       mlflow server
       --backend-store-uri postgresql://airflow:airflow@postgres/mlflow
       --default-artifact-root /mlflow/artifacts

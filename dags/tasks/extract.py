@@ -12,6 +12,7 @@ import requests
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 import json
+import ast
 
 logger = logging.getLogger(__name__)
 
@@ -269,7 +270,7 @@ def extract_sources(
     
     # Parse sources if passed as string from Airflow params
     if isinstance(sources, str):
-        sources = eval(sources)  # Convert string representation to list
+        sources = ast.literal_eval(sources)  # Convert string representation to list
     
     logger.info(f"Starting document extraction from sources: {sources}")
     

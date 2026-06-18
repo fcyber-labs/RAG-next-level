@@ -2,7 +2,7 @@
 Query rewriting using LLM to expand queries for better recall.
 Handles acronyms, synonyms, and related terms.
 """
-
+import os
 import json
 import logging
 import re

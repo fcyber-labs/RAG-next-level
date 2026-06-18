@@ -5,6 +5,7 @@ Document chunking with overlapping windows.
 import logging
 from typing import List, Dict, Any
 import tiktoken
+import ast
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ def _split_text_into_chunks(
     try:
         encoding = tiktoken.get_encoding("cl100k_base")
         tokens = encoding.encode(text)
-    except Exception as e:
+    except (ValueError, SyntaxError) as e:
         logger.error(f"Error encoding text: {e}")
         return []
     
@@ -98,7 +99,7 @@ def chunk_documents(
     # Handle XCom or string input
     if isinstance(documents, str):
         try:
-            documents = eval(documents)
+            documents = ast.literal_eval(documents)
         except Exception as e:
             logger.error(f"Could not parse documents from XCom:  {e}")
             return []

@@ -58,14 +58,14 @@ def send_pipeline_summary(status: str, eval_results: dict, docs_processed: int, 
             import ast
             eval_results = ast.literal_eval(eval_results)
         except Exception as e:
-            logger.error(f"Evaluation failed: {e}")
+            logger.error(f"Could not parse eval_results from XCom: {e}")
             eval_results = {}
     
     if isinstance(docs_processed, str):
         try:
             docs_processed = len(ast.literal_eval(docs_processed))
         except Exception as e:
-            logger.error(f"Evaluation failed: {e}")
+            logger.error(f"Could not parse eval_results from XCom: {e}")
             docs_processed = 0
     
     # Build message
@@ -101,7 +101,7 @@ def send_alert(message: str, eval_results: dict, threshold: float, **kwargs):
             import ast
             eval_results = ast.literal_eval(eval_results)
         except Exception as e:
-            logger.error(f"Evaluation failed: {e}")
+            logger.error(f"Could not parse eval_results from XCom: {e}")
             eval_results = {}
     
     if isinstance(threshold, str):

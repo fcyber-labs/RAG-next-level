@@ -8,6 +8,7 @@ from typing import List, Dict, Any
 import redis
 import os
 import json
+import ast
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,7 @@ def deduplicate_documents(documents: Any, **kwargs) -> List[Dict[str, Any]]:
     if isinstance(documents, str):
         # If passed as string, try to parse
         try:
-            documents = eval(documents)
+            documents = ast.literal_eval(documents)
         except Exception as e:  
             logger.error(f"Could not parse chunks from XCom: {e}")
             return []

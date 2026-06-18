@@ -8,6 +8,9 @@ from typing import Dict, Any
 from qdrant_client import QdrantClient
 import time
 
+
+from qdrant_client.models import PointStruct 
+
 logger = logging.getLogger(__name__)
 
 
@@ -58,6 +61,8 @@ def rollback_collection(
         }
 
 
+ 
+
 def promote_collection(
     staging_collection: str = "knowledge_base_staging",
     production_collection: str = "knowledge_base",
@@ -81,50 +86,66 @@ def promote_collection(
     logger.info(f"Promoting '{staging_collection}' to '{production_collection}'")
     
     client = _get_qdrant_client()
+    backup_name = f"{production_collection}_backup_{int(time.time())}"
     
+    # ===== STEP 1: Handle existing production collection =====
+    production_exists = False
     try:
-        # Backup strategy: rename current production to backup with timestamp
-        backup_name = f"{production_collection}_backup_{int(time.time())}"
-        
-        # Check if production exists
+        client.get_collection(production_collection)
+        production_exists = True
+        logger.info(f"Production collection '{production_collection}' exists")
+    except Exception as e:
+        # Only catch 404 (Not Found) - production doesn't exist
+        if "Not found" in str(e) or "404" in str(e):
+            logger.info(f"No existing production collection found")
+        else:
+            # Some other error (connection, auth, etc.) - re-raise
+            logger.error(f"Error checking production collection: {e}")
+            raise
+    
+    # ===== STEP 2: Backup existing production =====
+    if production_exists:
         try:
-            client.get_collection(production_collection)
-            logger.info(f"Creating backup of current production as '{backup_name}'")
-            
-            # Unfortunately Qdrant doesn't have direct rename, so we need to:
-            # 1. Create a new collection with backup name
-            # 2. Copy all points (for production, we'll use a snapshot approach)
-            # 3. For simplicity in this demo, we'll just delete old production
-            #    In real production, you'd want to create a snapshot first
-            
-            # Create snapshot of production before deletion
+            logger.info(f"Creating backup of current production as snapshot '{backup_name}'")
             snapshot_info = client.create_snapshot(production_collection)
             logger.info(f"Created snapshot: {snapshot_info}")
-            
-            # Delete old production
+        except Exception as e:
+            logger.warning(f"Failed to create snapshot of production: {e}")
+            # Continue with promotion (snapshot failure shouldn't block)
+        
+        # ===== STEP 3: Delete existing production =====
+        try:
             client.delete_collection(production_collection)
             logger.info(f"Deleted old production collection '{production_collection}'")
-        
         except Exception as e:
-            logger.info(f"No existing production collection to backup: {e}")
-        
-        # Get staging collection info
+            logger.error(f"Failed to delete production collection: {e}")
+            raise RuntimeError(f"Cannot promote: production deletion failed: {e}")
+    
+    # ===== STEP 4: Get staging config =====
+    try:
         staging_info = client.get_collection(staging_collection)
         vector_config = staging_info.config.params.vectors
-        
-        # Create new production collection with same config
+    except Exception as e:
+        logger.error(f"Failed to get staging collection info: {e}")
+        raise
+    
+    # ===== STEP 5: Create new production =====
+    try:
         client.create_collection(
             collection_name=production_collection,
             vectors_config=vector_config,
         )
         logger.info(f"Created new production collection '{production_collection}'")
-        
-        # Scroll through staging and copy all points to production
-        # This is a simplified approach; in production you might use snapshots
-        offset = None
-        batch_size = 100
-        total_copied = 0
-        
+    except Exception as e:
+        logger.error(f"Failed to create production collection: {e}")
+        raise
+    
+    # ===== STEP 6: Copy points from staging to production =====
+    offset = None
+    batch_size = 100
+    total_copied = 0
+    
+    try:
         while True:
             records, offset = client.scroll(
                 collection_name=staging_collection,
@@ -137,10 +158,19 @@ def promote_collection(
             if not records:
                 break
             
-            # Upsert to production
+            # FIX: Convert Record objects to PointStruct objects
+            points = [
+                PointStruct(
+                    id=record.id,
+                    vector=record.vector,
+                    payload=record.payload
+                )
+                for record in records
+            ]
+            
             client.upsert(
                 collection_name=production_collection,
-                points=records,
+                points=points,  # Now passing PointStruct, not Record
             )
             
             total_copied += len(records)
@@ -148,35 +178,28 @@ def promote_collection(
             
             if offset is None:
                 break
-        
-        logger.info(f"Promotion complete: copied {total_copied} points to production")
-        
-        # Optionally delete staging collection after successful promotion
+    except Exception as e:
+        logger.error(f"Failed to copy points from staging to production: {e}")
+        raise
+    
+    logger.info(f"Promotion complete: copied {total_copied} points to production")
+    
+    # ===== STEP 7: Clean up staging =====
+    try:
         client.delete_collection(staging_collection)
         logger.info(f"Deleted staging collection '{staging_collection}'")
-        
-        # Export metrics
-        from utils.metrics_exporter import export_counter
-        export_counter('collection_promotions_total', 1)
-        
-        return {
-            'success': True,
-            'action': 'promote',
-            'staging_collection': staging_collection,
-            'production_collection': production_collection,
-            'points_copied': total_copied,
-            'message': f'Successfully promoted {total_copied} points to production',
-        }
-    
     except Exception as e:
-        logger.error(f"Error during promotion: {e}")
-        
-        # Export failure metric
-        from utils.metrics_exporter import export_counter
-        export_counter('collection_promotion_failures_total', 1)
-        
-        return {
-            'success': False,
-            'action': 'promote',
-            'error': str(e),
-        }
+        logger.warning(f"Failed to delete staging collection: {e}")
+    
+    # Export metrics
+    from utils.metrics_exporter import export_counter
+    export_counter('collection_promotions_total', 1)
+    
+    return {
+        'success': True,
+        'action': 'promote',
+        'staging_collection': staging_collection,
+        'production_collection': production_collection,
+        'points_copied': total_copied,
+        'message': f'Successfully promoted {total_copied} points to production',
+    }

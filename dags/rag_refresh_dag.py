@@ -245,7 +245,7 @@ with dag:
     cost_prediction = PythonOperator(
         task_id='predict_monthly_costs',
         python_callable=predict_costs,
-        provide_context=True,
+
     )
 
     # ============================================
@@ -265,7 +265,7 @@ with dag:
     quality_gate = BranchPythonOperator(
         task_id='quality_gate_decision',
         python_callable=decide_promotion,
-        provide_context=True,
+
     )
 
     # ============================================
@@ -353,13 +353,23 @@ def finalize_run(eval_results, chunks_created, docs_processed, **context):
     quality_gate_result = context['task_instance'].xcom_pull(task_ids='quality_gate_decision')
     status = 'success' if quality_gate_result == 'promote_to_production' else 'rolled_back'
 
+    # Safely coerce string values to int (Airflow passes Jinja template results as strings)
+    def safe_int(value):
+        if isinstance(value, str):
+            return int(value) if value.isdigit() else 0
+        return value or 0
+
+    docs_extracted = context['task_instance'].xcom_pull(task_ids='extract_sources.extract_all_sources') or []
+    docs_processed_safe = safe_int(docs_processed)
+    chunks_created_safe = safe_int(chunks_created)
+
     log_ingestion_complete(
         log_id=log_id,
-        documents_extracted=len(context['task_instance'].xcom_pull(task_ids='extract_sources.extract_all_sources') or []),
-        documents_deduplicated=docs_processed,
-        chunks_created=chunks_created,
-        chunks_embedded=chunks_created,
-        vectors_upserted=chunks_created,
+        documents_extracted=len(docs_extracted),
+        documents_deduplicated=docs_processed_safe,
+        chunks_created=chunks_created_safe,
+        chunks_embedded=chunks_created_safe,
+        vectors_upserted=chunks_created_safe,
         status=status,
     )
 

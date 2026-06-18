@@ -320,7 +320,7 @@ with dag:
 
     log_metrics = PythonOperator(
         task_id='log_final_metrics',
-        python_callable=log_pipeline_metrics,
+        python_callable=finalize_run,
         trigger_rule='none_failed_min_one_success',
         op_kwargs={
             'eval_results': "{{ task_instance.xcom_pull(task_ids='run_retrieval_eval') }}",

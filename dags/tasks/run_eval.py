@@ -334,8 +334,8 @@ def run_retrieval_evaluation(
     export_gauge('eval_recall_at_5', avg_recall_at_5)
     export_gauge('eval_recall_at_10', avg_recall_at_10)
     export_gauge('eval_mrr', avg_mrr)
-    export_histogram('upsert_latency_seconds', avg_latency)   # reuse registered histogram
-    export_gauge('expired_docs_removed_gauge', expired_count)
+    export_histogram('eval_query_latency_seconds', avg_latency)
+    export_gauge('expired_docs_removed', expired_count)
     
     # Log to MLflow
     try:

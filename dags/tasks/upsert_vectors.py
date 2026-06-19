@@ -79,8 +79,18 @@ def upsert_to_qdrant(
             return {'success': False, 'points_upserted': 0}
     
     if not embedded_chunks:
-        logger.warning("No embedded chunks to upsert")
-        return {'success': False, 'points_upserted': 0}
+        # Raise — not a silent return. Returning {'success': False} without
+        # raising means Airflow marks this task SUCCESS and the downstream
+        # run_retrieval_eval starts, finds no collection in Qdrant, and
+        # crashes with a confusing 404. Raising here fails the task at the
+        # right place with the right message and prevents the downstream crash.
+        raise ValueError(
+            "upsert_to_qdrant received no embedded chunks. "
+            "The upstream embed/chunk/extract stages produced no output — "
+            "check that /opt/airflow/data/ contains documents and that "
+            "extract_sources, deduplicate_documents, chunk_documents, and "
+            "embed_chunks all completed with non-empty results."
+        )
     
     # Parse expiration_days if string
     if isinstance(expiration_days, str):

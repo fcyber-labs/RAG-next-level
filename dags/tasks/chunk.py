@@ -101,8 +101,11 @@ def chunk_documents(
         try:
             documents = ast.literal_eval(documents)
         except Exception as e:
-            logger.error(f"Could not parse documents from XCom:  {e}")
-            return []
+            raise RuntimeError(
+                f"chunk_documents could not parse its 'documents' XCom argument. "
+                f"The value from deduplicate_documents was not a valid Python literal. "
+                f"Parse error: {e}"
+            ) from e
     
     
     if not documents:

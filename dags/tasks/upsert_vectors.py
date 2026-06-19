@@ -72,11 +72,13 @@ def upsert_to_qdrant(
     # Handle XCom input
     if isinstance(embedded_chunks, str):
         try:
-            import ast
             embedded_chunks = ast.literal_eval(embedded_chunks)
         except Exception as e:
-            logger.error(f"Could not parse embedded_chunks from XCom: {e}")
-            return {'success': False, 'points_upserted': 0}
+            raise RuntimeError(
+                f"upsert_to_qdrant could not parse its 'embedded_chunks' XCom argument. "
+                f"The value from embed_chunks was not a valid Python literal. "
+                f"Parse error: {e}"
+            ) from e
     
     if not embedded_chunks:
         # Raise — not a silent return. Returning {'success': False} without

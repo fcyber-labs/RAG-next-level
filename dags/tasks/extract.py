@@ -99,8 +99,11 @@ def extract_from_filesystem(path: str) -> List[Dict[str, Any]]:
     path_obj = Path(path)
     
     if not path_obj.exists():
-        logger.warning(f"Filesystem path does not exist: {path}")
-        return documents
+        raise FileNotFoundError(
+            f"Filesystem extraction path does not exist in the container: '{path}'. "
+            f"Check that the Docker volume mount is working — run: "
+            f"docker exec airflow-scheduler ls -la {path}"
+        )
     
     # Supported file extensions
     extensions = ['.txt', '.pdf', '.md', '.html', '.json']
@@ -293,7 +296,17 @@ def extract_sources(
         all_documents.extend(url_docs)
     
     logger.info(f"Total documents extracted: {len(all_documents)}")
-    
+
+    if not all_documents:
+        raise ValueError(
+            "extract_sources found 0 documents across all configured sources. "
+            f"Sources attempted: {sources}. "
+            f"Filesystem path: '{filesystem_path}' — verify the Docker volume mount "
+            f"with: docker exec airflow-scheduler ls -la {filesystem_path}. "
+            f"URL list: '{url_list_path}'. "
+            "The pipeline cannot continue without input documents."
+        )
+
     # Log to metrics
     from utils.metrics_exporter import export_counter
     export_counter('documents_extracted_total', len(all_documents))

@@ -57,11 +57,13 @@ def embed_chunks(
     # Handle XCom string input (Airflow passes XCom values as strings in templates)
     if isinstance(chunks, str):
         try:
-            import ast
             chunks = ast.literal_eval(chunks)
         except Exception as e:
-            logger.error(f"Could not parse chunks from XCom string: {e}")
-            return []
+            raise RuntimeError(
+                f"embed_chunks could not parse its 'chunks' XCom argument. "
+                f"The value from chunk_documents was not a valid Python literal. "
+                f"Parse error: {e}"
+            ) from e
 
     if not chunks:
         logger.warning("No chunks to embed — returning empty list")
@@ -101,7 +103,11 @@ def embed_chunks(
 
         except Exception as e:
             logger.error(f"Error embedding batch at index {i}: {e}")
-            continue  # skip bad batch, continue with rest
+            raise RuntimeError(
+                f"Embedding failed for batch at index {i} using model '{model_name}'. "
+                f"Check that the model is installed/accessible and the input texts are valid. "
+                f"Error: {e}"
+            ) from e
 
     elapsed = time.time() - start_time
     logger.info(

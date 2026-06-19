@@ -52,12 +52,14 @@ def deduplicate_documents(documents: Any, **kwargs) -> List[Dict[str, Any]]:
     """
     # Handle XCom pull
     if isinstance(documents, str):
-        # If passed as string, try to parse
         try:
             documents = ast.literal_eval(documents)
-        except Exception as e:  
-            logger.error(f"Could not parse chunks from XCom: {e}")
-            return []
+        except Exception as e:
+            raise RuntimeError(
+                f"deduplicate_documents could not parse its 'documents' XCom argument. "
+                f"The value from extract_all_sources was not a valid Python literal. "
+                f"Parse error: {e}"
+            ) from e
     
     if not documents:
         logger.warning("No documents to deduplicate")

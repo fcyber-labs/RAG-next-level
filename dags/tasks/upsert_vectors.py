@@ -16,6 +16,7 @@ from qdrant_client.models import (
 from qdrant_client.http.exceptions import UnexpectedResponse
 import uuid
 from datetime import datetime, timedelta
+import ast
 
 logger = logging.getLogger(__name__)
 

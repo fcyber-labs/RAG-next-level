@@ -12,6 +12,7 @@ from qdrant_client import QdrantClient
 import time
 from datetime import datetime
 from utils.metadata_db import record_eval_result
+import ast
 
 logger = logging.getLogger(__name__)
 

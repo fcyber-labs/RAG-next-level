@@ -12,6 +12,7 @@ __all__ = [
     'send_pipeline_summary',
     'send_alert',
     'get_redis_client',
-    'check_document_hash',
+    'document_hash_exists',
+    'confirm_document_hash',
     'get_qdrant_client',
 ]

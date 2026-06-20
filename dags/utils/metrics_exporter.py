@@ -77,6 +77,13 @@ embedding_cost_counter = Counter(
     registry=registry
 )
 
+upsert_skipped_counter = Counter(
+    'rag_upsert_cycles_skipped_no_new_documents_total',
+    'Number of pipeline runs where 0 new/changed documents were found '
+    '(steady-state no-op — nothing new to upsert this cycle)',
+    registry=registry
+)
+
 # ─── Histograms ────────────────────────────────────────────────────────────
 
 embedding_latency = Histogram(
@@ -182,6 +189,7 @@ def export_counter(metric_name: str, value: float):
             'collection_promotions_total': collection_promotions_counter,
             'collection_promotion_failures_total': collection_promotion_failures_counter,
             'embedding_cost_usd': embedding_cost_counter,
+            'upsert_cycles_skipped_no_new_documents': upsert_skipped_counter,
         }
         
         counter = metric_map.get(metric_name)

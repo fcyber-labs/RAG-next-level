@@ -20,10 +20,12 @@ def start_mlflow_run(experiment_name: str, run_name: str, **kwargs):
         mlflow.set_experiment(experiment_name)
         mlflow.start_run(run_name=run_name)
         mlflow.log_param("start_time", datetime.now().isoformat())
-        mlflow.log_param(
-            "airflow_dag_id",
-            kwargs.get("dag_run", {}).get("dag_id", "unknown"),
-        )
+        # `dag_run` in Airflow's task context is a real DagRun ORM object
+        # (attribute access, e.g. `.dag_id`), not a dict — `.get(...)` on it
+        # raises AttributeError. Use getattr with a safe default instead.
+        dag_run = kwargs.get("dag_run")
+        dag_id = getattr(dag_run, "dag_id", "unknown") if dag_run is not None else "unknown"
+        mlflow.log_param("airflow_dag_id", dag_id)
         logger.info(f"Started MLflow run: {run_name}")
     except Exception as e:
         logger.error(f"Error starting MLflow run: {e}")

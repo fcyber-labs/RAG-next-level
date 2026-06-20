@@ -88,14 +88,26 @@ def extract_from_s3(bucket: str, prefix: str) -> List[Dict[str, Any]]:
 def extract_from_filesystem(path: str) -> List[Dict[str, Any]]:
     """
     Extract documents from local filesystem.
-    
+
     Args:
         path: Directory path to scan for documents
-        
+
     Returns:
         List of document dictionaries
     """
     documents = []
+
+    # Pipeline scaffolding files that live alongside the real knowledge-base
+    # documents in `data/` but are NOT content — they're config consumed by
+    # their own dedicated code paths (extract_from_urls reads
+    # urls_to_scrape.txt; run_retrieval_evaluation reads
+    # benchmark_queries.json). Without this exclusion, the generic
+    # extension-based glob below ingests them a second time as if they were
+    # real documents — their raw JSON/text becomes a chunk in the vector
+    # store, and benchmark_queries.json's `expected_docs` ground truth gets
+    # treated as searchable content instead of eval ground truth.
+    EXCLUDED_FILENAMES = {'benchmark_queries.json', 'urls_to_scrape.txt'}
+
     path_obj = Path(path)
     
     if not path_obj.exists():
@@ -109,6 +121,9 @@ def extract_from_filesystem(path: str) -> List[Dict[str, Any]]:
     extensions = ['.txt', '.pdf', '.md', '.html', '.json']
     
     for file_path in path_obj.rglob('*'):
+        if file_path.name in EXCLUDED_FILENAMES:
+            logger.info(f"Skipping pipeline scaffolding file (not knowledge content): {file_path.name}")
+            continue
         if file_path.is_file() and file_path.suffix.lower() in extensions:
             try:
                 with open(file_path, 'rb') as f:

@@ -27,12 +27,24 @@ def _get_openai_embeddings(texts: List[str], model: str) -> List[List[float]]:
     return [item.embedding for item in response.data]
 
 
-def _get_local_embeddings(texts: List[str], model_name: str) -> List[List[float]]:
-    """Get embeddings from a local HuggingFace SentenceTransformer model."""
-    from sentence_transformers import SentenceTransformer  # lazy import — heavy load
+_LOCAL_MODEL_CACHE: dict = {}
 
-    logger.info(f"Loading SentenceTransformer model: {model_name}")
-    model = SentenceTransformer(model_name)
+
+def _get_local_embeddings(texts: List[str], model_name: str) -> List[List[float]]:
+    """
+    Get embeddings from a local HuggingFace SentenceTransformer model.
+
+    The model is cached in-process after the first load. Without this,
+    every call (e.g. once per query during evaluation) reloads the model
+    from disk from scratch, which can take many seconds and dominates
+    total latency for no reason — the model never changes between calls.
+    """
+    if model_name not in _LOCAL_MODEL_CACHE:
+        from sentence_transformers import SentenceTransformer  # lazy import — heavy load
+        logger.info(f"Loading SentenceTransformer model: {model_name} (first use — caching for reuse)")
+        _LOCAL_MODEL_CACHE[model_name] = SentenceTransformer(model_name)
+
+    model = _LOCAL_MODEL_CACHE[model_name]
     embeddings = model.encode(texts, show_progress_bar=False)
     return embeddings.tolist()
 

@@ -297,9 +297,10 @@ def run_retrieval_evaluation(
             recall_at_10_scores.append(recall_at_10)
             mrr_scores.append(mrr)
             
-            logger.debug(
-                f"Query: '{query_text[:50]}...' | "
-                f"Recall@5: {recall_at_5:.2f} | MRR: {mrr:.2f}"
+            logger.info(
+                f"Query: '{query_text[:60]}' | "
+                f"expected={expected_docs} | retrieved={retrieved_docs[:5]} | "
+                f"recall@5={recall_at_5:.2f} | mrr={mrr:.2f}"
             )
         
         except Exception as e:

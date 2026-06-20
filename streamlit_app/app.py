@@ -214,8 +214,20 @@ if search_button and query:
                             st.json(payload)
         
         except Exception as e:
-            st.error(f"Error during search: {e}")
-            st.exception(e)
+            error_text = str(e)
+            if "doesn't exist" in error_text or "Not found" in error_text or "404" in error_text:
+                st.error(f"📪 Collection '{collection_name}' doesn't exist yet.")
+                st.info(
+                    "This usually means no pipeline run has successfully passed the "
+                    "quality gate yet (recall@5 below threshold), so nothing has been "
+                    "promoted from staging to production. Try searching "
+                    "**knowledge_base_staging** instead (top-left field), or check the "
+                    "`run_retrieval_eval` task logs in Airflow to see why retrieval "
+                    "quality is low."
+                )
+            else:
+                st.error(f"Error during search: {e}")
+                st.exception(e)
 
 elif search_button and not query:
     st.warning("Please enter a query to search.")

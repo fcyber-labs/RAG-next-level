@@ -210,8 +210,9 @@ if search_button and query:
                             score_cols[3].metric("Reranker", f"{result['reranker_score']:.3f}")
                         
                         # Additional metadata
-                        with st.expander("View full metadata"):
-                            st.json(payload)
+                        st.divider()
+                        st.markdown("### Full Metadata")
+                        st.json(payload)
         
         except Exception as e:
             error_text = str(e)

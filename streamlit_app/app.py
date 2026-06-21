@@ -40,19 +40,20 @@ st.title("🔍 RAG Knowledge Base Search")
 st.markdown("**Real-time search with hybrid retrieval + reranking**")
 
 
-def generate_answer(query: str, context_chunks: list) -> str:
+def generate_answer_stream(query: str, context_chunks: list):
     """
-    Generate an answer using Groq LLM based on retrieved context.
+    Generate an answer using Groq LLM with streaming.
     
     Args:
         query: User's question
         context_chunks: List of retrieved text chunks
         
-    Returns:
-        Generated answer string
+    Yields:
+        Chunks of the answer as they're generated
     """
     if not GROQ_AVAILABLE or not context_chunks:
-        return "LLM answer generation unavailable. Please check Groq API key or retrieved context."
+        yield "LLM answer generation unavailable. Please check Groq API key or retrieved context."
+        return
     
     try:
         client = Groq(api_key=os.getenv("GROQ_API_KEY"))
@@ -63,14 +64,15 @@ def generate_answer(query: str, context_chunks: list) -> str:
             for i, chunk in enumerate(context_chunks[:5])  # Use top 5 chunks for context
         ])
         
-        # Estimate tokens for max_tokens (rough: ~4 chars per token)
+        # Estimate tokens for max_tokens
         query_length = len(query)
         context_length = len(context_text)
         estimated_tokens = (query_length + context_length) // 4
         max_tokens = 2048
         
-        response = client.chat.completions.create(
-            model='openai/gpt-oss-120b',  # Or use 'llama-3.1-70b-versatile' or other available model
+        # Create streaming request
+        stream = client.chat.completions.create(
+            model='openai/gpt-oss-120b',
             messages=[
                 {
                     "role": "system",
@@ -91,7 +93,71 @@ def generate_answer(query: str, context_chunks: list) -> str:
                 },
             ],
             max_tokens=max_tokens,
-            temperature=0.3,  # Lower temperature for factual answers
+            temperature=0.3,
+            stream=True,  # ✅ Enable streaming
+        )
+        
+        # Yield chunks as they arrive
+        for chunk in stream:
+            if chunk.choices[0].delta.content is not None:
+                yield chunk.choices[0].delta.content
+    
+    except Exception as e:
+        yield f"Error generating answer: {str(e)}"
+
+
+def generate_answer(query: str, context_chunks: list) -> str:
+    """
+    Generate an answer using Groq LLM based on retrieved context (non-streaming fallback).
+    
+    Args:
+        query: User's question
+        context_chunks: List of retrieved text chunks
+        
+    Returns:
+        Generated answer string
+    """
+    if not GROQ_AVAILABLE or not context_chunks:
+        return "LLM answer generation unavailable. Please check Groq API key or retrieved context."
+    
+    try:
+        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        
+        # Prepare context from retrieved chunks
+        context_text = "\n\n---\n\n".join([
+            f"Context {i+1}:\n{chunk.get('payload', {}).get('text', chunk.get('text', ''))}"
+            for i, chunk in enumerate(context_chunks[:5])  # Use top 5 chunks for context
+        ])
+        
+        # Estimate tokens for max_tokens
+        query_length = len(query)
+        context_length = len(context_text)
+        estimated_tokens = (query_length + context_length) // 4
+        max_tokens = 2048
+        
+        response = client.chat.completions.create(
+            model='openai/gpt-oss-120b',
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a helpful assistant that answers questions based on the provided context. "
+                        "Use ONLY the context provided to answer the question. "
+                        "If the context doesn't contain the answer, say 'I don't have enough information to answer this question.' "
+                        "Be concise and direct in your answer."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Context:\n{context_text}\n\n"
+                        f"Question: {query}\n\n"
+                        f"Answer based ONLY on the context above:"
+                    ),
+                },
+            ],
+            max_tokens=max_tokens,
+            temperature=0.3,
         )
         
         return response.choices[0].message.content.strip()
@@ -131,6 +197,12 @@ use_llm_answer = st.sidebar.checkbox(
     "Generate LLM Answer",
     value=True,
     help="Use Groq LLM to generate a concise answer from retrieved context"
+)
+
+use_streaming = st.sidebar.checkbox(
+    "Use Streaming",
+    value=True,
+    help="Stream the answer as it's generated (faster perceived response)"
 )
 
 top_k = st.sidebar.slider(
@@ -245,20 +317,57 @@ if search_button and query:
             else:
                 results = results[:top_k]
             
-            # Step 5: Generate LLM Answer (optional)
-            answer = None
+            # Step 5: Generate and Display LLM Answer (optional)
             if use_llm_answer and results:
-                st.info("🤖 Generating answer from context...")
-                answer = generate_answer(query, results)
-            
-            # Display Answer (if generated)
-            if answer:
                 st.markdown("---")
                 st.subheader("💡 Answer")
                 
-                # Use st.info with the answer directly (it handles markdown!)
-                st.info(answer, icon="💡")
+                # Create a placeholder for streaming
+                answer_placeholder = st.empty()
                 
+                if use_streaming:
+                    # ✅ STREAMING MODE - shows answer as it's generated
+                    full_answer = ""
+                    for chunk in generate_answer_stream(query, results):
+                        full_answer += chunk
+                        # Update the placeholder with the current answer
+                        answer_placeholder.markdown(
+                            f"""
+                            <div style="
+                                background-color: #d4edda;
+                                padding: 20px;
+                                border-radius: 10px;
+                                border-left: 5px solid #28a745;
+                                color: #155724;
+                                font-size: 16px;
+                            ">
+                            {full_answer}
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+                else:
+                    # Non-streaming mode - generate all at once
+                    with st.spinner("🤖 Generating answer..."):
+                        answer = generate_answer(query, results)
+                        # ✅ FIX: Green box with the answer
+                        answer_placeholder.markdown(
+                            f"""
+                            <div style="
+                                background-color: #d4edda;
+                                padding: 20px;
+                                border-radius: 10px;
+                                border-left: 5px solid #28a745;
+                                color: #155724;
+                                font-size: 16px;
+                            ">
+                            {answer}
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+                
+                # Show sources after the answer
                 with st.expander("📚 View Sources"):
                     for idx, result in enumerate(results[:3], 1):
                         payload = result.get("payload", {})
@@ -276,7 +385,7 @@ if search_button and query:
                 st.warning("No results found. Try a different query.")
             else:
                 for idx, result in enumerate(results, 1):
-                    with st.expander(f"**Result #{idx}** - Score: {result.get('combined_score', result.get('score', 0)):.4f}", expanded=(idx == 1 and not answer)):
+                    with st.expander(f"**Result #{idx}** - Score: {result.get('combined_score', result.get('score', 0)):.4f}", expanded=(idx == 1 and not use_llm_answer)):
                         # Metadata
                         payload = result.get('payload', {})
                         

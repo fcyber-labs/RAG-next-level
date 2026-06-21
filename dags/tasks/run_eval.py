@@ -12,7 +12,6 @@ from qdrant_client import QdrantClient
 import time
 from datetime import datetime
 from utils.metadata_db import record_eval_result
-import ast
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +21,23 @@ def _get_qdrant_client() -> QdrantClient:
     host = os.getenv('QDRANT_HOST', 'localhost')
     port = int(os.getenv('QDRANT_PORT', 6333))
     return QdrantClient(host=host, port=port)
+
+
+def _collection_exists(client: QdrantClient, collection_name: str) -> bool:
+    """
+    Check whether a collection exists in Qdrant.
+
+    This MUST be called before any client.scroll()/client.search() on a
+    collection that might not have been created yet (e.g. on a fresh
+    deployment or before the first ingestion run) — Qdrant raises a 404
+    for scroll/search against a missing collection, which would otherwise
+    crash the caller.
+    """
+    try:
+        client.get_collection(collection_name)
+        return True
+    except Exception:
+        return False
 
 
 def _load_benchmark_queries(benchmark_path: str) -> List[Dict[str, Any]]:
@@ -92,6 +108,16 @@ def _filter_expired_documents(client: QdrantClient, collection_name: str) -> int
     """
     
     try:
+        # Guard: scrolling a collection that doesn't exist yet raises a 404
+        # in qdrant-client. Check existence up front instead of discovering
+        # it via an exception deep inside the scroll loop.
+        if not _collection_exists(client, collection_name):
+            logger.warning(
+                f"Collection '{collection_name}' does not exist yet — "
+                f"skipping expired-document cleanup (nothing to clean)"
+            )
+            return 0
+
         # Get current timestamp
         now = datetime.now().isoformat()
         
@@ -178,23 +204,16 @@ def run_retrieval_evaluation(
     
     client = _get_qdrant_client()
 
-    # Step 0: Verify collection exists before doing anything else.
-    # The upsert task runs before this task, so a missing collection means
-    # the upstream task failed or was skipped — fail fast with a clear message.
-    try:
-        client.get_collection(collection_name)
-    except Exception as e:
-        logger.error(
-            f"Collection '{collection_name}' does not exist in Qdrant. "
-            f"Ensure the upsert_vectors task completed successfully before "
-            f"running retrieval evaluation. Original error: {e}"
-        )
-        raise RuntimeError(
-            f"Collection '{collection_name}' not found in Qdrant. "
-            "Cannot run evaluation on a missing collection."
-        ) from e
+    # Guard: every code path below (_filter_expired_documents, the BM25
+    # chunk-loading scroll, and the vector search itself) assumes the
+    # collection exists. Check once up front so a missing collection fails
+    # fast and clearly instead of crashing inside client.scroll().
+    if not _collection_exists(client, collection_name):
+        error_msg = f"Collection '{collection_name}' does not exist in Qdrant"
+        logger.error(error_msg)
+        return {'success': False, 'error': error_msg}
 
-    # Step 1: Filter expired documents (safe — collection is confirmed to exist)
+    # Step 0: Filter expired documents
     expired_count = _filter_expired_documents(client, collection_name)
     
     # Load benchmark queries
@@ -297,10 +316,9 @@ def run_retrieval_evaluation(
             recall_at_10_scores.append(recall_at_10)
             mrr_scores.append(mrr)
             
-            logger.info(
-                f"Query: '{query_text[:60]}' | "
-                f"expected={expected_docs} | retrieved={retrieved_docs[:5]} | "
-                f"recall@5={recall_at_5:.2f} | mrr={mrr:.2f}"
+            logger.debug(
+                f"Query: '{query_text[:50]}...' | "
+                f"Recall@5: {recall_at_5:.2f} | MRR: {mrr:.2f}"
             )
         
         except Exception as e:

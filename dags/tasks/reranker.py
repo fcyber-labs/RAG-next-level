@@ -82,6 +82,9 @@ class Reranker:
         return top_results
 
 
+_RERANKER_CACHE: dict = {}
+
+
 def rerank_results(
     query: str,
     results: List[Dict[str, Any]],
@@ -104,7 +107,14 @@ def rerank_results(
     if not results:
         return []
 
-    reranker = Reranker(model_name=model_name)
+    # Cache Reranker instances by model_name. Without this, every call
+    # (e.g. once per query during evaluation) reloads the CrossEncoder
+    # model from disk from scratch — the same cost-multiplying bug that
+    # was fixed in embed.py's _get_local_embeddings, just not yet applied
+    # here. The model never changes between calls within a run.
+    if model_name not in _RERANKER_CACHE:
+        _RERANKER_CACHE[model_name] = Reranker(model_name=model_name)
+    reranker = _RERANKER_CACHE[model_name]
     reranked = reranker.rerank(query=query, results=results, top_k=top_k)
 
     # Export metrics via module-level reference so unit-test mocks are honoured.

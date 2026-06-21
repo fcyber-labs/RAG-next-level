@@ -167,6 +167,18 @@ def upsert_to_qdrant(
     export_counter('vectors_upserted_total', points_upserted)
     export_histogram('upsert_latency_seconds', elapsed_time)
     export_gauge('collection_total_points', total_points)
+
+    # Invalidate the Streamlit app's Redis-cached BM25 chunk list and any
+    # cached LLM answers for this collection — it just changed, so both
+    # are now stale.
+    if points_upserted > 0:
+        try:
+            from utils.chunk_cache import invalidate_chunk_cache
+            from utils.answer_cache import invalidate_answer_cache
+            invalidate_chunk_cache(collection_name)
+            invalidate_answer_cache(collection_name)
+        except Exception as e:
+            logger.warning(f"Could not invalidate caches for '{collection_name}': {e}")
     
     return {
         'success': True,

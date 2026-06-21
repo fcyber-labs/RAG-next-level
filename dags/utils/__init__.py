@@ -15,4 +15,10 @@ __all__ = [
     'document_hash_exists',
     'confirm_document_hash',
     'get_qdrant_client',
+    'get_cached_chunks',
+    'set_cached_chunks',
+    'invalidate_chunk_cache',
+    'get_cached_answer',
+    'set_cached_answer',
+    'invalidate_answer_cache',
 ]

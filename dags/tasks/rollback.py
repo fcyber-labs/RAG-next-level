@@ -43,6 +43,17 @@ def rollback_collection(
         # Delete the staging collection
         client.delete_collection(staging_collection)
         logger.info(f"Successfully deleted staging collection '{staging_collection}'")
+
+        # The staging collection no longer exists — drop any cached BM25
+        # chunk list and cached LLM answers for it so the Streamlit app
+        # doesn't serve stale data for a collection that's gone.
+        try:
+            from utils.chunk_cache import invalidate_chunk_cache
+            from utils.answer_cache import invalidate_answer_cache
+            invalidate_chunk_cache(staging_collection)
+            invalidate_answer_cache(staging_collection)
+        except Exception as e:
+            logger.warning(f"Could not invalidate caches for '{staging_collection}': {e}")
         
         return {
             'success': True,
@@ -194,6 +205,20 @@ def promote_collection(
     # Export metrics
     from utils.metrics_exporter import export_counter
     export_counter('collection_promotions_total', 1)
+
+    # Production now holds entirely new points, and staging no longer
+    # exists — drop any cached BM25 chunk lists and cached LLM answers
+    # for both so the next Streamlit search rebuilds from the current
+    # state instead of serving stale data.
+    try:
+        from utils.chunk_cache import invalidate_chunk_cache
+        from utils.answer_cache import invalidate_answer_cache
+        invalidate_chunk_cache(production_collection)
+        invalidate_chunk_cache(staging_collection)
+        invalidate_answer_cache(production_collection)
+        invalidate_answer_cache(staging_collection)
+    except Exception as e:
+        logger.warning(f"Could not invalidate caches after promotion: {e}")
     
     return {
         'success': True,

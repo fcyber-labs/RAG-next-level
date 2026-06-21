@@ -7,6 +7,7 @@ import streamlit as st
 import os
 import sys
 import json
+import time
 from datetime import datetime
 import markdown
 
@@ -18,6 +19,8 @@ from dags.tasks.hybrid_search import perform_hybrid_search
 import dags.tasks.query_rewriter as query_rewriter
 from dags.tasks.reranker import rerank_results
 from dags.utils.vector_store import get_qdrant_client, get_collection_info
+from dags.utils.chunk_cache import get_cached_chunks, set_cached_chunks
+from dags.utils.answer_cache import get_cached_answer, set_cached_answer
 
 # Try to import Groq for LLM answer generation
 try:
@@ -205,6 +208,16 @@ use_streaming = st.sidebar.checkbox(
     help="Stream the answer as it's generated (faster perceived response)"
 )
 
+use_answer_cache = st.sidebar.checkbox(
+    "Cache LLM Answers (Redis)",
+    value=True,
+    help=(
+        "Reuse a recent answer for the same question + retrieval settings "
+        "instead of calling the LLM again. Cached answers are labeled "
+        "in the UI and skip the LLM call entirely (no streaming)."
+    )
+)
+
 top_k = st.sidebar.slider(
     "Number of Results",
     min_value=1,
@@ -269,26 +282,35 @@ if search_button and query:
             if use_hybrid_search:
                 st.info("🔍 Performing hybrid search (BM25 + Vector)...")
                 
-                # Get all chunks for BM25 (simplified - in production, cache this)
-                all_chunks = []
-                offset = None
-                while True:
-                    records, offset = client.scroll(
-                        collection_name=collection_name,
-                        limit=100,
-                        offset=offset,
-                        with_payload=True,
-                        with_vectors=False
-                    )
-                    if not records:
-                        break
-                    for record in records:
-                        all_chunks.append({
-                            'id': record.id,
-                            'text': record.payload.get('text', '')
-                        })
-                    if offset is None:
-                        break
+                # Get all chunks for BM25 — cached in Redis (5 min TTL) so a
+                # large collection doesn't get fully re-scrolled from Qdrant
+                # on every single search. Cache is actively invalidated by
+                # upsert_to_qdrant / promote_collection / rollback_collection
+                # whenever the collection's contents actually change.
+                all_chunks = get_cached_chunks(collection_name)
+                if all_chunks is not None:
+                    st.caption(f"⚡ Loaded {len(all_chunks)} chunks from Redis cache")
+                else:
+                    all_chunks = []
+                    offset = None
+                    while True:
+                        records, offset = client.scroll(
+                            collection_name=collection_name,
+                            limit=100,
+                            offset=offset,
+                            with_payload=True,
+                            with_vectors=False
+                        )
+                        if not records:
+                            break
+                        for record in records:
+                            all_chunks.append({
+                                'id': record.id,
+                                'text': record.payload.get('text', '')
+                            })
+                        if offset is None:
+                            break
+                    set_cached_chunks(collection_name, all_chunks)
                 
                 results = perform_hybrid_search(
                     query=search_query,
@@ -324,8 +346,50 @@ if search_button and query:
                 
                 # Create a placeholder for streaming
                 answer_placeholder = st.empty()
-                
-                if use_streaming:
+
+                # Check the answer cache first. The key folds in every
+                # setting that can change which chunks the LLM sees
+                # (collection, retrieval mode, reranking, top_k) — not
+                # just the raw question — so a hit here is guaranteed to
+                # match what a fresh call would have produced *for the
+                # current knowledge base*. The cache is actively cleared
+                # whenever that knowledge base changes (see
+                # upsert_to_qdrant / promote_collection /
+                # rollback_collection), so "current" really means current.
+                cached = (
+                    get_cached_answer(
+                        collection_name=collection_name,
+                        query=query,
+                        use_hybrid_search=use_hybrid_search,
+                        use_query_rewriting=use_query_rewriting,
+                        use_reranking=use_reranking,
+                        top_k=top_k,
+                    )
+                    if use_answer_cache else None
+                )
+
+                if cached is not None:
+                    # ⚡ CACHE HIT — no LLM call, no streaming. This is
+                    # surfaced explicitly so it's never mistaken for a
+                    # live generation.
+                    age_seconds = max(0, int(time.time() - cached.get('cached_at', time.time())))
+                    answer_placeholder.markdown(
+                        f"""
+                        <div style="
+                            background-color: #d4edda;
+                            padding: 20px;
+                            border-radius: 10px;
+                            border-left: 5px solid #28a745;
+                            color: #155724;
+                            font-size: 16px;
+                        ">
+                        {cached['answer']}
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+                    st.caption(f"⚡ Cached answer (generated {age_seconds}s ago) — LLM was not called")
+                elif use_streaming:
                     # ✅ STREAMING MODE - shows answer as it's generated
                     full_answer = ""
                     for chunk in generate_answer_stream(query, results):
@@ -346,6 +410,16 @@ if search_button and query:
                             """,
                             unsafe_allow_html=True
                         )
+                    if use_answer_cache:
+                        set_cached_answer(
+                            collection_name=collection_name,
+                            query=query,
+                            use_hybrid_search=use_hybrid_search,
+                            use_query_rewriting=use_query_rewriting,
+                            use_reranking=use_reranking,
+                            top_k=top_k,
+                            answer=full_answer,
+                        )
                 else:
                     # Non-streaming mode - generate all at once
                     with st.spinner("🤖 Generating answer..."):
@@ -365,6 +439,16 @@ if search_button and query:
                             </div>
                             """,
                             unsafe_allow_html=True
+                        )
+                    if use_answer_cache:
+                        set_cached_answer(
+                            collection_name=collection_name,
+                            query=query,
+                            use_hybrid_search=use_hybrid_search,
+                            use_query_rewriting=use_query_rewriting,
+                            use_reranking=use_reranking,
+                            top_k=top_k,
+                            answer=answer,
                         )
                 
                 # Show sources after the answer

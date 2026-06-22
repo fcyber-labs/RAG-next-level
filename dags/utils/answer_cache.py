@@ -1,36 +1,57 @@
 """
-Redis-backed cache for generated LLM answers in the Streamlit search UI.
+Redis-backed semantic cache for generated LLM answers.
 
-This is a companion to chunk_cache.py: chunk_cache avoids re-scrolling
-Qdrant for the BM25 index, this avoids re-calling the (paid, slower) LLM
-for a question that's already been answered recently with the same
-retrieval settings against the same collection.
+SEMANTIC CACHING — how it works
+--------------------------------
+Instead of requiring the query string to match exactly (hash equality),
+this cache embeds every incoming query and compares it against the
+embeddings of previously-answered queries using cosine similarity.  Any
+stored answer whose query embedding is within `similarity_threshold`
+(default 0.95) of the current query's embedding is treated as a hit and
+returned without calling the LLM.
 
-IMPORTANT — staleness is handled the same way as the chunk cache:
-  - Short TTL as a safety net (default 5 minutes).
+This catches natural paraphrases automatically, e.g.:
+  "What is the vacation policy?"   → cache miss  → LLM called, stored
+  "Tell me about the vacation policy" → similarity 0.97 → cache HIT
+
+Redis data layout (per collection + settings fingerprint)
+---------------------------------------------------------
+Each cached entry is stored at:
+    rag:semantic_answer:{collection}:{uuid4}
+as a JSON blob containing:
+    {
+      "answer":    str,
+      "embedding": List[float],   ← the query embedding, stored for comparison
+      "cached_at": float,         ← unix timestamp
+      "settings":  {...}          ← retrieval settings fingerprint
+    }
+
+An index set per (collection, settings-hash) tracks which UUIDs belong
+to which context so that:
+  1. Lookup only scans entries with the SAME retrieval settings (a query
+     answered with reranking=True must not hit a cache entry that was
+     built with reranking=False, because different chunks → different answer).
+  2. Invalidation only needs to delete the index + its member keys.
+
+Index key:
+    rag:semantic_index:{collection}:{settings_hash}
+
+STALENESS
+---------
+Same two-layer approach as chunk_cache.py:
+  - TTL (default 5 min) self-heals any missed invalidation.
   - Active invalidation: upsert_to_qdrant / promote_collection /
-    rollback_collection all call invalidate_answer_cache() for any
-    collection whose contents just changed, so a cache hit can never
-    outlive the data it was generated from.
-
-The cache key is NOT just the raw query string — it also folds in
-collection_name and every retrieval setting that can change which chunks
-get passed to the LLM (use_hybrid_search, use_query_rewriting,
-use_reranking, top_k). Two identical questions asked with different
-toggle settings are treated as different cache entries, because they can
-legitimately produce different answers from different context.
-
-On a cache hit, the answer is returned WITHOUT calling the LLM — no
-streaming, no fresh generation. The UI MUST make this visible (see the
-"⚡ Cached answer" badge in streamlit_app/app.py); silently returning a
-cached answer in place of a "live" one would be misleading.
+    rollback_collection all call invalidate_answer_cache() whenever the
+    underlying collection changes, so a cache hit can never outlive the
+    data it was generated from.
 """
 
-import hashlib
 import json
 import logging
+import math
 import time
-from typing import Optional, Dict, Any
+import uuid
+from typing import Optional, Dict, Any, List
 
 import redis
 
@@ -38,75 +59,145 @@ from .hash_store import get_redis_client
 
 logger = logging.getLogger(__name__)
 
-ANSWER_CACHE_KEY_PREFIX = "rag:answer:"
-DEFAULT_TTL_SECONDS = 5 * 60  # same window as the chunk cache
+ENTRY_KEY_PREFIX  = "rag:semantic_answer:"
+INDEX_KEY_PREFIX  = "rag:semantic_index:"
+DEFAULT_TTL_SECONDS       = 5 * 60   # 5 minutes — same as chunk cache
+SIMILARITY_THRESHOLD      = 0.8     # cosine similarity to count as a hit
 
 
-def _cache_key(
-    collection_name: str,
-    query: str,
+# ─── helpers ──────────────────────────────────────────────────────────────────
+
+def _cosine_similarity(a: List[float], b: List[float]) -> float:
+    """Pure-Python cosine similarity — no numpy required."""
+    dot  = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _settings_hash(
     use_hybrid_search: bool,
     use_query_rewriting: bool,
     use_reranking: bool,
     top_k: int,
 ) -> str:
     """
-    Build a deterministic cache key from the question AND every retrieval
-    setting that can change which chunks the LLM sees. Two questions with
-    different toggle combinations are deliberately different cache
-    entries.
+    Short deterministic identifier for the retrieval-settings combination.
+    Entries with different settings never compete in the similarity scan.
     """
-    normalized_query = query.strip().lower()
-    fingerprint = json.dumps(
+    import hashlib
+    blob = json.dumps(
         {
-            "query": normalized_query,
-            "use_hybrid_search": bool(use_hybrid_search),
+            "use_hybrid_search":   bool(use_hybrid_search),
             "use_query_rewriting": bool(use_query_rewriting),
-            "use_reranking": bool(use_reranking),
-            "top_k": int(top_k),
+            "use_reranking":       bool(use_reranking),
+            "top_k":               int(top_k),
         },
         sort_keys=True,
     )
-    digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
-    return f"{ANSWER_CACHE_KEY_PREFIX}{collection_name}:{digest}"
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
+
+def _index_key(collection_name: str, s_hash: str) -> str:
+    return f"{INDEX_KEY_PREFIX}{collection_name}:{s_hash}"
+
+
+def _entry_key(entry_id: str) -> str:
+    return f"{ENTRY_KEY_PREFIX}{entry_id}"
+
+
+# ─── public API ───────────────────────────────────────────────────────────────
 
 def get_cached_answer(
     collection_name: str,
-    query: str,
+    query_embedding: List[float],
     use_hybrid_search: bool,
     use_query_rewriting: bool,
     use_reranking: bool,
     top_k: int,
+    similarity_threshold: float = SIMILARITY_THRESHOLD,
 ) -> Optional[Dict[str, Any]]:
     """
-    Look up a cached answer for this exact (collection, query, settings)
-    combination.
+    Semantic cache lookup.
+
+    Scans all stored answers for (collection_name + settings) and returns
+    the best match if its cosine similarity to query_embedding is ≥
+    similarity_threshold.
+
+    Args:
+        collection_name:       Qdrant collection being searched.
+        query_embedding:       Embedding of the current query (already
+                               computed in Step 2 of the search flow —
+                               reused here, no extra LLM/embed call).
+        use_hybrid_search:     Retrieval setting (part of settings fingerprint).
+        use_query_rewriting:   Retrieval setting.
+        use_reranking:         Retrieval setting.
+        top_k:                 Retrieval setting.
+        similarity_threshold:  Minimum cosine similarity to count as a hit
+                               (default 0.95).
 
     Returns:
-        {'answer': str, 'cached_at': float} on a hit, or None on a miss
-        or Redis error. On None, the caller should call the LLM as
-        normal — caching is a performance/cost optimization, never a
-        correctness requirement.
+        {'answer': str, 'cached_at': float, 'similarity': float} on a hit,
+        or None on a miss or Redis error.
     """
     try:
-        client = get_redis_client()
-        key = _cache_key(
-            collection_name, query, use_hybrid_search,
-            use_query_rewriting, use_reranking, top_k,
-        )
-        raw = client.get(key)
-        if raw is None:
+        rc      = get_redis_client()
+        s_hash  = _settings_hash(use_hybrid_search, use_query_rewriting, use_reranking, top_k)
+        idx_key = _index_key(collection_name, s_hash)
+
+        # Fetch all entry IDs for this (collection, settings) combination
+        entry_ids = rc.smembers(idx_key)
+        if not entry_ids:
             return None
-        return json.loads(raw)
+
+        best_sim   = -1.0
+        best_entry = None
+
+        for raw_id in entry_ids:
+            eid = raw_id.decode() if isinstance(raw_id, bytes) else raw_id
+            raw = rc.get(_entry_key(eid))
+            if raw is None:
+                # Entry expired via TTL but index set wasn't cleaned up yet
+                rc.srem(idx_key, eid)
+                continue
+
+            entry = json.loads(raw)
+            stored_embedding = entry.get("embedding")
+            if not stored_embedding:
+                continue
+
+            sim = _cosine_similarity(query_embedding, stored_embedding)
+            if sim > best_sim:
+                best_sim   = sim
+                best_entry = entry
+
+        if best_entry is not None and best_sim >= similarity_threshold:
+            logger.info(
+                f"Semantic cache HIT for '{collection_name}' "
+                f"(similarity={best_sim:.4f} ≥ {similarity_threshold})"
+            )
+            return {
+                "answer":     best_entry["answer"],
+                "cached_at":  best_entry["cached_at"],
+                "similarity": best_sim,
+            }
+
+        logger.debug(
+            f"Semantic cache miss for '{collection_name}' "
+            f"(best similarity={best_sim:.4f} < {similarity_threshold})"
+        )
+        return None
+
     except (redis.RedisError, json.JSONDecodeError, ValueError) as e:
-        logger.warning(f"Redis answer-cache read failed: {e}")
+        logger.warning(f"Redis semantic-cache read failed: {e}")
         return None
 
 
 def set_cached_answer(
     collection_name: str,
-    query: str,
+    query_embedding: List[float],
     use_hybrid_search: bool,
     use_query_rewriting: bool,
     use_reranking: bool,
@@ -115,37 +206,81 @@ def set_cached_answer(
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
 ) -> None:
     """
-    Store a freshly-generated LLM answer, keyed by query + collection +
-    retrieval settings. Failures are logged and swallowed — a failed
-    cache write should never break an answer that already succeeded.
+    Store a freshly-generated LLM answer together with the query embedding
+    so future similar queries can match it semantically.
+
+    The entry is registered in the index set for its (collection, settings)
+    combination so invalidation can find and delete it.
+
+    Failures are logged and swallowed — a failed cache write should never
+    break a search that already succeeded.
     """
     try:
-        client = get_redis_client()
-        key = _cache_key(
-            collection_name, query, use_hybrid_search,
-            use_query_rewriting, use_reranking, top_k,
+        rc      = get_redis_client()
+        s_hash  = _settings_hash(use_hybrid_search, use_query_rewriting, use_reranking, top_k)
+        idx_key = _index_key(collection_name, s_hash)
+        eid     = str(uuid.uuid4())
+        ekey    = _entry_key(eid)
+
+        payload = json.dumps({
+            "answer":    answer,
+            "embedding": query_embedding,
+            "cached_at": time.time(),
+            "settings":  {
+                "use_hybrid_search":   use_hybrid_search,
+                "use_query_rewriting": use_query_rewriting,
+                "use_reranking":       use_reranking,
+                "top_k":               top_k,
+            },
+        })
+
+        pipe = rc.pipeline()
+        pipe.set(ekey, payload.encode("utf-8"), ex=ttl_seconds)
+        pipe.sadd(idx_key, eid)
+        pipe.expire(idx_key, ttl_seconds)
+        pipe.execute()
+
+        logger.debug(
+            f"Stored semantic cache entry '{eid}' for '{collection_name}' "
+            f"(TTL {ttl_seconds}s)"
         )
-        payload = json.dumps({"answer": answer, "cached_at": time.time()})
-        client.set(key, payload.encode("utf-8"), ex=ttl_seconds)
-        logger.debug(f"Cached LLM answer for '{collection_name}' (TTL {ttl_seconds}s)")
+
     except redis.RedisError as e:
-        logger.warning(f"Redis answer-cache write failed: {e}")
+        logger.warning(f"Redis semantic-cache write failed: {e}")
 
 
 def invalidate_answer_cache(collection_name: str) -> None:
     """
     Drop every cached answer for a collection (all queries, all settings
     combinations). Call this whenever the collection's contents change —
-    upsert, promote, rollback — the same trigger points used by
-    chunk_cache.invalidate_chunk_cache(), so an answer can never outlive
-    the data it was generated from.
+    upsert, promote, rollback — same trigger points as
+    chunk_cache.invalidate_chunk_cache().
     """
     try:
-        client = get_redis_client()
-        pattern = f"{ANSWER_CACHE_KEY_PREFIX}{collection_name}:*"
-        keys = client.keys(pattern)
-        if keys:
-            client.delete(*keys)
-            logger.info(f"Invalidated {len(keys)} cached answers for '{collection_name}'")
+        rc = get_redis_client()
+
+        # Find all index keys for this collection (all settings hashes)
+        idx_pattern = f"{INDEX_KEY_PREFIX}{collection_name}:*"
+        idx_keys    = rc.keys(idx_pattern)
+
+        total_deleted = 0
+        for idx_key in idx_keys:
+            entry_ids = rc.smembers(idx_key)
+            if entry_ids:
+                ekeys = [_entry_key(
+                    eid.decode() if isinstance(eid, bytes) else eid
+                ) for eid in entry_ids]
+                rc.delete(*ekeys)
+                total_deleted += len(ekeys)
+            rc.delete(idx_key)
+
+        if total_deleted:
+            logger.info(
+                f"Invalidated {total_deleted} semantic cache entries "
+                f"for '{collection_name}'"
+            )
+
     except redis.RedisError as e:
-        logger.warning(f"Redis answer-cache invalidation failed for '{collection_name}': {e}")
+        logger.warning(
+            f"Redis semantic-cache invalidation failed for '{collection_name}': {e}"
+        )

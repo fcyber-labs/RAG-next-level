@@ -21,7 +21,8 @@ longer than necessary.
 
 import json
 import logging
-from typing import List, Dict, Any, Optional
+import pickle
+from typing import List, Dict, Any, Optional, Tuple
 
 import redis
 
@@ -30,6 +31,7 @@ from .hash_store import get_redis_client
 logger = logging.getLogger(__name__)
 
 CHUNK_CACHE_KEY_PREFIX = "rag:chunks:"
+BM25_CACHE_KEY_PREFIX  = "rag:bm25:"
 
 # Short TTL: long enough to absorb a burst of searches against the same
 # collection, short enough that a missed invalidation self-heals quickly
@@ -108,4 +110,89 @@ def invalidate_chunk_cache(collection_name: str) -> None:
     except redis.RedisError as e:
         logger.warning(
             f"Redis chunk-cache invalidation failed for '{collection_name}': {e}"
+        )
+    # Always invalidate the BM25 cache too — it was built from these same chunks
+    invalidate_bm25_cache(collection_name)
+
+
+# ─── BM25 index cache ─────────────────────────────────────────────────────────
+
+def get_bm25_index(
+    collection_name: str,
+) -> Tuple[Optional[object], Optional[List[Dict[str, Any]]]]:
+    """
+    Load the pre-built BM25Okapi index and companion chunk list from Redis.
+
+    Returns:
+        (bm25_index, chunks) on a hit, or (None, None) on a miss / Redis error.
+        On (None, None) the caller should fall back to building the index inline
+        from a fresh Qdrant scroll — caching is a performance optimisation, not
+        a correctness requirement.
+
+        chunks is a list of {'id': str, 'text': str, 'payload': dict} dicts,
+        i.e. the full payload is included so sparse-only hits can be displayed
+        without an extra round-trip to Qdrant.
+    """
+    try:
+        client = get_redis_client()
+        key = f"{BM25_CACHE_KEY_PREFIX}{collection_name}"
+        raw = client.get(key)
+        if raw is None:
+            return None, None
+        data = pickle.loads(raw)
+        return data['bm25'], data['chunks']
+    except (redis.RedisError, pickle.UnpicklingError, KeyError) as e:
+        logger.warning(f"Redis BM25-cache read failed for '{collection_name}': {e}")
+        return None, None
+
+
+def set_bm25_index(
+    collection_name: str,
+    bm25_index: object,
+    chunks: List[Dict[str, Any]],
+    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+) -> None:
+    """
+    Pickle and store a pre-built BM25Okapi index together with the chunk list.
+
+    Called by the Airflow `prepare_search_cache` task at the end of each
+    pipeline run so the index is warm before the first search arrives.
+    Failures are logged and swallowed.
+
+    Args:
+        collection_name: Qdrant collection name
+        bm25_index:      A fully-built BM25Okapi object
+        chunks:          List of {'id', 'text', 'payload'} dicts (same order
+                         as the BM25 corpus so index positions align)
+        ttl_seconds:     Cache lifetime (default 5 min)
+    """
+    try:
+        client = get_redis_client()
+        key  = f"{BM25_CACHE_KEY_PREFIX}{collection_name}"
+        data = pickle.dumps({'bm25': bm25_index, 'chunks': chunks})
+        client.set(key, data, ex=ttl_seconds)
+        logger.info(
+            f"Cached BM25 index for '{collection_name}' "
+            f"({len(chunks)} chunks, TTL {ttl_seconds}s)"
+        )
+    except redis.RedisError as e:
+        logger.warning(f"Redis BM25-cache write failed for '{collection_name}': {e}")
+
+
+def invalidate_bm25_cache(collection_name: str) -> None:
+    """
+    Drop the cached BM25 index for a collection. Called automatically by
+    invalidate_chunk_cache and directly by upsert/promote/rollback tasks.
+
+    Args:
+        collection_name: Qdrant collection name
+    """
+    try:
+        client = get_redis_client()
+        key = f"{BM25_CACHE_KEY_PREFIX}{collection_name}"
+        client.delete(key)
+        logger.info(f"Invalidated BM25 cache for '{collection_name}'")
+    except redis.RedisError as e:
+        logger.warning(
+            f"Redis BM25-cache invalidation failed for '{collection_name}': {e}"
         )

@@ -19,7 +19,7 @@ from dags.tasks.hybrid_search import perform_hybrid_search
 import dags.tasks.query_rewriter as query_rewriter
 from dags.tasks.reranker import rerank_results
 from dags.utils.vector_store import get_qdrant_client, get_collection_info
-from dags.utils.chunk_cache import get_cached_chunks, set_cached_chunks
+from dags.utils.chunk_cache import get_cached_chunks, set_cached_chunks, get_bm25_index, set_bm25_index
 from dags.utils.answer_cache import get_cached_answer, set_cached_answer
 
 # Try to import Groq for LLM answer generation
@@ -241,6 +241,18 @@ try:
 except Exception as e:
     st.sidebar.error(f"Error: {e}")
 
+# Sidebar - Search Timer
+st.sidebar.header("⏱ Performance")
+_timer_slot = st.sidebar.empty()
+
+if 'last_elapsed' not in st.session_state:
+    st.session_state.last_elapsed = None
+
+if st.session_state.last_elapsed is not None:
+    _timer_slot.metric("Last Search Latency", f"{st.session_state.last_elapsed:.2f}s")
+else:
+    _timer_slot.caption("Run a search to see latency")
+
 
 # Main search interface
 st.markdown("---")
@@ -256,6 +268,8 @@ search_button = st.button("Search", type="primary", use_container_width=True)
 
 # Search logic
 if search_button and query:
+    _t0 = time.time()
+    _timer_slot.info("⏳ Searching…")
     with st.spinner("Searching..."):
         try:
             # Step 1: Query rewriting (optional)
@@ -280,17 +294,23 @@ if search_button and query:
                         
             # Step 3: Search
             if use_hybrid_search:
-                st.info("🔍 Performing hybrid search (BM25 + Vector)...")
-                
-                # Get all chunks for BM25 — cached in Redis (5 min TTL) so a
-                # large collection doesn't get fully re-scrolled from Qdrant
-                # on every single search. Cache is actively invalidated by
-                # upsert_to_qdrant / promote_collection / rollback_collection
-                # whenever the collection's contents actually change.
-                all_chunks = get_cached_chunks(collection_name)
-                if all_chunks is not None:
-                    st.caption(f"⚡ Loaded {len(all_chunks)} chunks from Redis cache")
+                st.info("🔍 Hybrid search: 5 dense (Qdrant) + 5 sparse (BM25)…")
+
+                # Load pre-built BM25 index from Redis (warmed by Airflow's
+                # prepare_search_cache task after every upsert). On a cache
+                # hit the O(N) scroll + BM25 build are completely skipped,
+                # dropping latency from ~10s to ~2s.
+                bm25_index, all_chunks = get_bm25_index(collection_name)
+
+                if bm25_index is not None:
+                    st.caption(
+                        f"⚡ Pre-built BM25 index loaded from Redis "
+                        f"({len(all_chunks)} chunks)"
+                    )
                 else:
+                    # Cache miss — scroll Qdrant inline (fallback path).
+                    # Store payload so sparse-only hits can be displayed
+                    # without a second round-trip.
                     all_chunks = []
                     offset = None
                     while True:
@@ -299,25 +319,30 @@ if search_button and query:
                             limit=100,
                             offset=offset,
                             with_payload=True,
-                            with_vectors=False
+                            with_vectors=False,
                         )
                         if not records:
                             break
                         for record in records:
                             all_chunks.append({
-                                'id': record.id,
-                                'text': record.payload.get('text', '')
+                                'id':      str(record.id),
+                                'text':    record.payload.get('text', ''),
+                                'payload': record.payload,
                             })
                         if offset is None:
                             break
                     set_cached_chunks(collection_name, all_chunks)
-                
+                    # bm25_index stays None; perform_hybrid_search builds it
+
                 results = perform_hybrid_search(
                     query=search_query,
                     query_vector=query_embedding,
                     collection_name=collection_name,
                     chunks=all_chunks,
-                    top_k=top_k * 2  # Get more for reranking
+                    bm25_index=bm25_index,
+                    dense_top_k=5,
+                    sparse_top_k=5,
+                    top_k=top_k * 2 if use_reranking else top_k,
                 )
             else:
                 st.info("🔍 Performing vector search...")
@@ -347,19 +372,14 @@ if search_button and query:
                 # Create a placeholder for streaming
                 answer_placeholder = st.empty()
 
-                # Check the answer cache first. The key folds in every
-                # setting that can change which chunks the LLM sees
-                # (collection, retrieval mode, reranking, top_k) — not
-                # just the raw question — so a hit here is guaranteed to
-                # match what a fresh call would have produced *for the
-                # current knowledge base*. The cache is actively cleared
-                # whenever that knowledge base changes (see
-                # upsert_to_qdrant / promote_collection /
-                # rollback_collection), so "current" really means current.
+                # Semantic cache check — uses the embedding already computed
+                # in Step 2 (no extra model call). Finds any stored answer
+                # whose query embedding is within similarity_threshold of
+                # the current query's embedding, regardless of exact wording.
                 cached = (
                     get_cached_answer(
                         collection_name=collection_name,
-                        query=query,
+                        query_embedding=query_embedding,
                         use_hybrid_search=use_hybrid_search,
                         use_query_rewriting=use_query_rewriting,
                         use_reranking=use_reranking,
@@ -373,6 +393,7 @@ if search_button and query:
                     # surfaced explicitly so it's never mistaken for a
                     # live generation.
                     age_seconds = max(0, int(time.time() - cached.get('cached_at', time.time())))
+                    similarity  = cached.get('similarity', 1.0)
                     answer_placeholder.markdown(
                         f"""
                         <div style="
@@ -388,7 +409,7 @@ if search_button and query:
                         """,
                         unsafe_allow_html=True
                     )
-                    st.caption(f"⚡ Cached answer (generated {age_seconds}s ago) — LLM was not called")
+                    st.caption(f"⚡ Semantic cache hit (similarity={similarity:.3f}, generated {age_seconds}s ago) — LLM was not called")
                 elif use_streaming:
                     # ✅ STREAMING MODE - shows answer as it's generated
                     full_answer = ""
@@ -413,7 +434,7 @@ if search_button and query:
                     if use_answer_cache:
                         set_cached_answer(
                             collection_name=collection_name,
-                            query=query,
+                            query_embedding=query_embedding,
                             use_hybrid_search=use_hybrid_search,
                             use_query_rewriting=use_query_rewriting,
                             use_reranking=use_reranking,
@@ -443,7 +464,7 @@ if search_button and query:
                     if use_answer_cache:
                         set_cached_answer(
                             collection_name=collection_name,
-                            query=query,
+                            query_embedding=query_embedding,
                             use_hybrid_search=use_hybrid_search,
                             use_query_rewriting=use_query_rewriting,
                             use_reranking=use_reranking,

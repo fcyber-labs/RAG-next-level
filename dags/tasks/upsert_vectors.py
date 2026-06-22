@@ -175,7 +175,7 @@ def upsert_to_qdrant(
         try:
             from utils.chunk_cache import invalidate_chunk_cache
             from utils.answer_cache import invalidate_answer_cache
-            invalidate_chunk_cache(collection_name)
+            invalidate_chunk_cache(collection_name)   # also calls invalidate_bm25_cache
             invalidate_answer_cache(collection_name)
         except Exception as e:
             logger.warning(f"Could not invalidate caches for '{collection_name}': {e}")

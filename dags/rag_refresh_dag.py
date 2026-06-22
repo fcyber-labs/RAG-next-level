@@ -18,6 +18,7 @@ from tasks.embed import embed_chunks
 from tasks.upsert_vectors import upsert_to_qdrant
 from tasks.run_eval import run_retrieval_evaluation
 from tasks.rollback import rollback_collection, promote_collection
+from tasks.prepare_search_cache import prepare_search_cache
 
 # Import NEW enhanced tasks
 #from tasks.hybrid_search import perform_hybrid_search
@@ -184,6 +185,20 @@ with dag:
     )
 
     # ============================================
+    # Stage 5b: Warm the search cache in Redis
+    # Build BM25 index + store chunk list so Streamlit
+    # cold-starts in ~2s instead of ~10s
+    # ============================================
+
+    warm_cache = PythonOperator(
+        task_id='prepare_search_cache',
+        python_callable=prepare_search_cache,
+        op_kwargs={
+            'collection_name': 'knowledge_base_staging',
+        },
+    )
+
+    # ============================================
     # Stage 6: Retrieval evaluation
     # ============================================
 
@@ -338,7 +353,7 @@ with dag:
     # Task dependencies
     # ============================================
 
-    start >> init_log >> init_mlflow >> extract_group >> dedupe >> chunk >> embed >> upsert >> evaluate >> cost_prediction >> quality_gate
+    start >> init_log >> init_mlflow >> extract_group >> dedupe >> chunk >> embed >> upsert >> warm_cache >> evaluate >> cost_prediction >> quality_gate
 
     # Success path
     quality_gate >> promote >> send_success_summary >> log_metrics >> end

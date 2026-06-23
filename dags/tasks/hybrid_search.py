@@ -1,190 +1,237 @@
 """
 Hybrid search combining BM25 (keyword) + Vector (semantic) search.
 Provides better recall for exact matches and semantic queries.
+
+Fair split
+----------
+Dense and sparse candidates are retrieved in equal halves of top_k:
+  dense_k  = ceil(top_k / 2)   e.g. top_k=6  → 3 dense
+  sparse_k = top_k - dense_k   e.g. top_k=6  → 3 sparse
+The two sets are unioned (deduplicated by ID), scored with weighted fusion,
+and the top top_k results are returned. This guarantees keyword-only
+matches always get representation in the final list, not just when they
+happened to appear in the Qdrant ANN top-N.
+
+Pre-built index
+---------------
+The Airflow `prepare_search_cache` task builds and pickles the BM25Okapi
+index after every successful upsert and stores it in Redis.
+`perform_hybrid_search` accepts an optional `bm25_index` parameter; when
+supplied, the O(N) tokenise-and-build step is skipped entirely (~1-3s
+saved on large corpora). Callers that don't pass a pre-built index (e.g.
+`run_retrieval_evaluation`) still work correctly — the index is built
+inline from `chunks` as before.
 """
 
 import logging
-from typing import List, Dict, Any
-from rank_bm25 import BM25Okapi
-import numpy as np
+import math
+from typing import Any, Dict, List, Optional
 
+import numpy as np
+from rank_bm25 import BM25Okapi
 
 from utils.vector_store import search_similar
-
 
 logger = logging.getLogger(__name__)
 
 
+# ─── tokeniser (shared with prepare_search_cache) ─────────────────────────────
+
 def tokenize(text: str) -> List[str]:
-    """
-    Simple tokenization for BM25.
-    
-    Args:
-        text: Input text
-        
-    Returns:
-        List of lowercase tokens
-    """
-    # Simple word-level tokenization
-    # In production, you might use spaCy or NLTK
+    """Simple word-level tokeniser for BM25."""
     return text.lower().split()
 
 
+# ─── searcher ─────────────────────────────────────────────────────────────────
+
 class HybridSearcher:
     """
-    Combines BM25 keyword search with vector semantic search.
-    Uses weighted fusion to combine scores.
+    Combines BM25 keyword search with Qdrant dense vector search using
+    weighted score fusion and a fair dense/sparse candidate split.
     """
-    
-    def __init__(self, chunks: List[Dict[str, Any]], bm25_weight: float = 0.3):
+
+    def __init__(
+        self,
+        chunks: List[Dict[str, Any]],
+        bm25_weight: float = 0.3,
+        bm25_index: Optional[BM25Okapi] = None,
+    ):
         """
-        Initialize hybrid searcher.
-        
         Args:
-            chunks: List of chunk dictionaries with 'text' field
-            bm25_weight: Weight for BM25 scores (0-1). Vector weight = 1 - bm25_weight
+            chunks:      Full chunk list [{'id', 'text', 'payload'}].
+                         Must be in the same order as the BM25 corpus.
+            bm25_weight: BM25 fraction of the combined score (default 0.3).
+            bm25_index:  Pre-built BM25Okapi from Redis. If None the index
+                         is built from chunks here.
         """
-        self.chunks = chunks
-        self.bm25_weight = bm25_weight
+        self.chunks        = chunks
+        self.bm25_weight   = bm25_weight
         self.vector_weight = 1.0 - bm25_weight
-        
-        # Build BM25 index
-        logger.info(f"Building BM25 index for {len(chunks)} chunks...")
-        tokenized_corpus = [tokenize(chunk['text']) for chunk in chunks]
-        self.bm25 = BM25Okapi(tokenized_corpus)
-        logger.info("BM25 index built successfully")
-    
+
+        if bm25_index is not None:
+            self.bm25 = bm25_index
+            logger.info("Using pre-built BM25 index from Redis ⚡")
+        else:
+            logger.info(f"Building BM25 index for {len(chunks)} chunks...")
+            tokenized_corpus = [tokenize(c.get('text', '')) for c in chunks]
+            self.bm25 = BM25Okapi(tokenized_corpus)
+            logger.info("BM25 index built successfully")
+
+        # id → corpus index for fast lookups
+        self._idx_by_id: Dict[str, int] = {
+            str(c.get('id', str(i))): i for i, c in enumerate(chunks)
+        }
+
     def search(
         self,
         query: str,
         query_vector: List[float],
-        qdrant_results: List[Dict[str, Any]],
-        top_k: int = 10
+        collection_name: str,
+        top_k: int = 10,
     ) -> List[Dict[str, Any]]:
         """
-        Perform hybrid search combining BM25 and vector scores.
-        
+        Retrieve ceil(top_k/2) dense candidates from Qdrant and
+        floor(top_k/2) sparse candidates from BM25, union them, fuse
+        scores, and return the top top_k results.
+
         Args:
-            query: Text query
-            query_vector: Query embedding vector
-            qdrant_results: Results from Qdrant vector search (with scores)
-            top_k: Number of results to return
-            
+            query:           Raw query text (BM25 tokenisation).
+            query_vector:    Query embedding (Qdrant ANN search).
+            collection_name: Qdrant collection to search.
+            top_k:           Total candidates to return after fusion.
+
         Returns:
-            List of results sorted by combined score
+            List of result dicts with id, vector_score, bm25_score,
+            combined_score, and payload.
         """
-        # Step 1: Get BM25 scores for all chunks
-        query_tokens = tokenize(query)
-        bm25_scores = self.bm25.get_scores(query_tokens)
-        
-        # Step 2: Normalize BM25 scores to 0-1 range
-        bm25_max = np.max(bm25_scores) if len(bm25_scores) > 0 else 1.0
-        if bm25_max > 0:
-            bm25_scores_normalized = bm25_scores / bm25_max
-        else:
-            bm25_scores_normalized = bm25_scores
-        
-        # Step 3: Create chunk_id -> BM25 score mapping
-        bm25_score_map = {}
-        for idx, chunk in enumerate(self.chunks):
-            chunk_id = chunk.get('id', str(idx))
-            bm25_score_map[chunk_id] = bm25_scores_normalized[idx]
-        
-        # Step 4: Combine with vector scores
-        combined_results = []
-        for result in qdrant_results:
-            chunk_id = result.get('id')
-            vector_score = result.get('score', 0.0)
-            bm25_score = bm25_score_map.get(chunk_id, 0.0)
-            
-            # Weighted fusion
-            combined_score = (
-                self.vector_weight * vector_score +
-                self.bm25_weight * bm25_score
+        dense_k  = math.ceil(top_k / 2)
+        sparse_k = top_k - dense_k
+
+        # ── 1. Dense candidates from Qdrant ───────────────────────────────
+        try:
+            dense_results = search_similar(
+                collection_name=collection_name,
+                query_vector=query_vector,
+                limit=dense_k,
             )
-            
-            result['bm25_score'] = float(bm25_score)
-            result['vector_score'] = float(vector_score)
-            result['combined_score'] = float(combined_score)
-            combined_results.append(result)
-        
-        # Step 5: Re-rank by combined score
-        combined_results.sort(key=lambda x: x['combined_score'], reverse=True)
-        
-        # Step 6: Return top-k
-        top_results = combined_results[:top_k]
-        
-        logger.info(
-            f"Hybrid search complete: "
-            f"BM25 weight={self.bm25_weight}, "
-            f"Vector weight={self.vector_weight}, "
-            f"Top result combined_score={top_results[0]['combined_score']:.3f}"
-        )
-        
+        except Exception as e:
+            logger.error(f"Qdrant vector search failed: {e}")
+            dense_results = []
+
+        dense_by_id: Dict[str, Dict] = {str(r['id']): r for r in dense_results}
+
+        # ── 2. Sparse candidates from BM25 ────────────────────────────────
+        query_tokens = tokenize(query)
+        bm25_raw     = self.bm25.get_scores(query_tokens)
+
+        bm25_max  = float(np.max(bm25_raw)) if len(bm25_raw) > 0 else 1.0
+        bm25_norm = (bm25_raw / bm25_max) if bm25_max > 0 else bm25_raw
+
+        top_sparse_idx = np.argsort(bm25_norm)[-sparse_k:][::-1]
+        sparse_by_id: Dict[str, float] = {
+            str(self.chunks[i].get('id', str(i))): float(bm25_norm[i])
+            for i in top_sparse_idx
+        }
+
+        # ── 3. Union ──────────────────────────────────────────────────────
+        all_ids = set(dense_by_id.keys()) | set(sparse_by_id.keys())
+
+        # ── 4. Score fusion ───────────────────────────────────────────────
+        results = []
+        for cid in all_ids:
+            vs = float(dense_by_id[cid].get('score', 0.0)) if cid in dense_by_id else 0.0
+
+            if cid in sparse_by_id:
+                bs = sparse_by_id[cid]
+            else:
+                idx = self._idx_by_id.get(cid)
+                bs  = float(bm25_norm[idx]) if idx is not None else 0.0
+
+            combined = self.vector_weight * vs + self.bm25_weight * bs
+
+            # Payload: prefer live Qdrant payload, fall back to cached chunk
+            if cid in dense_by_id:
+                payload = dense_by_id[cid].get('payload', {})
+            else:
+                idx     = self._idx_by_id.get(cid)
+                chunk   = self.chunks[idx] if idx is not None else {}
+                payload = chunk.get('payload', {'text': chunk.get('text', '')})
+
+            results.append({
+                'id':             cid,
+                'score':          vs,
+                'vector_score':   vs,
+                'bm25_score':     bs,
+                'combined_score': combined,
+                'payload':        payload,
+            })
+
+        # ── 5. Sort and return ────────────────────────────────────────────
+        results.sort(key=lambda x: x['combined_score'], reverse=True)
+        top_results = results[:top_k]
+
+        if top_results:
+            logger.info(
+                f"Hybrid search ({dense_k} dense + {sparse_k} sparse → "
+                f"{len(results)} candidates): "
+                f"returning top {len(top_results)}, "
+                f"best combined={top_results[0]['combined_score']:.3f}"
+            )
+
         return top_results
+
+
+# ─── public entry point ───────────────────────────────────────────────────────
 
 def perform_hybrid_search(
     query: str,
     query_vector: List[float],
     collection_name: str,
     chunks: List[Dict[str, Any]],
+    bm25_index: Optional[BM25Okapi] = None,
     bm25_weight: float = 0.3,
     top_k: int = 10,
-    **kwargs
+    **kwargs,
 ) -> List[Dict[str, Any]]:
     """
-    Main function to perform hybrid search.
-    
+    Run hybrid search: ceil(top_k/2) dense + floor(top_k/2) sparse,
+    score-fused and sorted.
+
     Args:
-        query: Text query
-        query_vector: Query embedding
-        collection_name: Qdrant collection name
-        chunks: All chunks with text (for BM25)
-        bm25_weight: Weight for BM25 (default 0.3 = 30% BM25, 70% vector)
-        top_k: Number of results
-        
+        query:           Query text.
+        query_vector:    Query embedding.
+        collection_name: Qdrant collection.
+        chunks:          Full chunk corpus [{'id', 'text', 'payload'}].
+        bm25_index:      Pre-built BM25Okapi from Redis (optional).
+                         Pass None to build inline (backwards-compatible).
+        bm25_weight:     BM25 fraction of combined score (default 0.3).
+        top_k:           Total results to return.
+
     Returns:
-        Hybrid search results
+        Ranked list with id, vector_score, bm25_score, combined_score,
+        payload.
     """
-    
-    
-    # Handle empty chunks case
     if not chunks:
-        logger.warning("No chunks provided, returning empty results")
+        logger.warning("No chunks provided for hybrid search — returning empty results")
         return []
-    
-    # Step 1: Get vector search results from Qdrant
-    logger.info(f"Performing vector search in '{collection_name}'...")
+
     try:
-        qdrant_results = search_similar(
-            collection_name=collection_name,
-            query_vector=query_vector,
-            limit=top_k * 2  # Get more results for re-ranking
+        searcher = HybridSearcher(
+            chunks=chunks,
+            bm25_weight=bm25_weight,
+            bm25_index=bm25_index,
         )
-    except Exception as e:
-        logger.error(f"Vector search failed: {e}")
-        qdrant_results = []
-    
-    # Step 2: Initialize hybrid searcher (will fail if chunks empty, but we already checked)
-    try:
-        searcher = HybridSearcher(chunks=chunks, bm25_weight=bm25_weight)
-        
-        # Step 3: Combine scores
-        hybrid_results = searcher.search(
+        results = searcher.search(
             query=query,
             query_vector=query_vector,
-            qdrant_results=qdrant_results,
-            top_k=top_k
+            collection_name=collection_name,
+            top_k=top_k,
         )
-    except ZeroDivisionError as e:
-        logger.error(f"BM25 error (empty corpus?): {e}")
-        # Fallback to vector results only
-        hybrid_results = qdrant_results[:top_k]
-    
-    logger.info(f"Hybrid search returned {len(hybrid_results)} results")
-    
-    # Export metrics
+    except Exception as e:
+        logger.error(f"Hybrid search failed, falling back to vector-only: {e}")
+        results = search_similar(collection_name, query_vector, limit=top_k)
+
     from utils.metrics_exporter import export_gauge
     export_gauge('hybrid_search_bm25_weight', bm25_weight)
-    
-    return hybrid_results
+
+    return results

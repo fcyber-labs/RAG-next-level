@@ -27,7 +27,12 @@ class Reranker:
             model_name: HuggingFace cross-encoder model name
         """
         logger.info(f"Loading reranker model: {model_name}")
-        self.model = CrossEncoder(model_name)
+        # Force CPU explicitly. Without this, newer versions of transformers
+        # load weights as meta-tensors (lazy, device-less) and then
+        # CrossEncoder.predict() calls model.to(target_device) which raises:
+        #   NotImplementedError: Cannot copy out of meta tensor; no data!
+        # Pinning to CPU prevents the device-move entirely.
+        self.model = CrossEncoder(model_name, device='cpu', max_length=512)
         logger.info("Reranker model loaded successfully")
 
     def rerank(

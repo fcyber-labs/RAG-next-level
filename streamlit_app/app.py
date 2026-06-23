@@ -294,7 +294,12 @@ if search_button and query:
                         
             # Step 3: Search
             if use_hybrid_search:
-                st.info("🔍 Hybrid search: 5 dense (Qdrant) + 5 sparse (BM25)…")
+                # Fair split: ceil(top_k/2) dense + floor(top_k/2) sparse
+                import math as _math
+                _candidates = top_k * 2 if use_reranking else top_k
+                _dense_k  = _math.ceil(_candidates / 2)
+                _sparse_k = _candidates - _dense_k
+                st.info(f"🔍 Hybrid search: {_dense_k} dense (Qdrant) + {_sparse_k} sparse (BM25)…")
 
                 # Load pre-built BM25 index from Redis (warmed by Airflow's
                 # prepare_search_cache task after every upsert). On a cache
@@ -309,8 +314,6 @@ if search_button and query:
                     )
                 else:
                     # Cache miss — scroll Qdrant inline (fallback path).
-                    # Store payload so sparse-only hits can be displayed
-                    # without a second round-trip.
                     all_chunks = []
                     offset = None
                     while True:
@@ -332,7 +335,7 @@ if search_button and query:
                         if offset is None:
                             break
                     set_cached_chunks(collection_name, all_chunks)
-                    # bm25_index stays None; perform_hybrid_search builds it
+                    # bm25_index stays None; perform_hybrid_search builds it inline
 
                 results = perform_hybrid_search(
                     query=search_query,
@@ -340,9 +343,7 @@ if search_button and query:
                     collection_name=collection_name,
                     chunks=all_chunks,
                     bm25_index=bm25_index,
-                    dense_top_k=5,
-                    sparse_top_k=5,
-                    top_k=top_k * 2 if use_reranking else top_k,
+                    top_k=_candidates,
                 )
             else:
                 st.info("🔍 Performing vector search...")
@@ -350,7 +351,7 @@ if search_button and query:
                 results = search_similar(
                     collection_name=collection_name,
                     query_vector=query_embedding,
-                    limit=top_k * 2
+                    limit=top_k * 2 if use_reranking else top_k
                 )
             
             # Step 4: Reranking (optional)
@@ -409,6 +410,10 @@ if search_button and query:
                         """,
                         unsafe_allow_html=True
                     )
+                    # ⏱ Timer stops here — cache hit is the last output
+                    _elapsed = time.time() - _t0
+                    st.session_state.last_elapsed = _elapsed
+                    _timer_slot.metric("Last Search Latency", f"{_elapsed:.2f}s")
                     st.caption(f"⚡ Semantic cache hit (similarity={similarity:.3f}, generated {age_seconds}s ago) — LLM was not called")
                 elif use_streaming:
                     # ✅ STREAMING MODE - shows answer as it's generated
@@ -431,6 +436,10 @@ if search_button and query:
                             """,
                             unsafe_allow_html=True
                         )
+                    # ⏱ Timer stops here — last symbol of the streamed answer
+                    _elapsed = time.time() - _t0
+                    st.session_state.last_elapsed = _elapsed
+                    _timer_slot.metric("Last Search Latency", f"{_elapsed:.2f}s")
                     if use_answer_cache:
                         set_cached_answer(
                             collection_name=collection_name,
@@ -461,6 +470,10 @@ if search_button and query:
                             """,
                             unsafe_allow_html=True
                         )
+                    # ⏱ Timer stops here — non-streaming answer is the last output
+                    _elapsed = time.time() - _t0
+                    st.session_state.last_elapsed = _elapsed
+                    _timer_slot.metric("Last Search Latency", f"{_elapsed:.2f}s")
                     if use_answer_cache:
                         set_cached_answer(
                             collection_name=collection_name,
@@ -524,8 +537,21 @@ if search_button and query:
                         st.divider()
                         st.markdown("### Full Metadata")
                         st.json(payload)
+
+            # ⏱ Timer stop for the no-LLM path — results display is the last output.
+            # (When LLM answer is enabled the timer is stopped inside the
+            # streaming/non-streaming/cache branches above, so this is a
+            # safe no-op in that case because last_elapsed is already set.)
+            if not use_llm_answer or not results:
+                _elapsed = time.time() - _t0
+                st.session_state.last_elapsed = _elapsed
+                _timer_slot.metric("Last Search Latency", f"{_elapsed:.2f}s")
         
         except Exception as e:
+            # ⏱ Stop timer even on error
+            _elapsed = time.time() - _t0
+            st.session_state.last_elapsed = _elapsed
+            _timer_slot.metric("Last Search Latency", f"{_elapsed:.2f}s ❌")
             error_text = str(e)
             if "doesn't exist" in error_text or "Not found" in error_text or "404" in error_text:
                 st.error(f"📪 Collection '{collection_name}' doesn't exist yet.")

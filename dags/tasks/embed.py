@@ -42,12 +42,50 @@ def _get_local_embeddings(texts: List[str], model_name: str) -> List[List[float]
     if model_name not in _LOCAL_MODEL_CACHE:
         from sentence_transformers import SentenceTransformer  # lazy import — heavy load
         logger.info(f"Loading SentenceTransformer model: {model_name} (first use — caching for reuse)")
-        # Force CPU explicitly. Without this, newer transformers loads weights
-        # as meta-tensors (lazy/device-less) and SentenceTransformer.__init__
-        # immediately calls self.to(device), which crashes with:
-        #   NotImplementedError: Cannot copy out of meta tensor; no data!
-        # Pinning to CPU prevents the device-move entirely.
-        _LOCAL_MODEL_CACHE[model_name] = SentenceTransformer(model_name, device='cpu')
+
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+        # -----------------------------------------------------------------------
+        # Fix: "Cannot copy out of meta tensor; no data!" (torch 2.x + accelerate)
+        #
+        # Root cause: when accelerate is installed, newer transformers (≥ 4.40)
+        # defaults low_cpu_mem_usage=True inside AutoModel.from_pretrained(),
+        # loading weights as lazy meta-tensors instead of real CPU tensors.
+        # SentenceTransformer.__init__ then calls self.to(device) — even with
+        # device='cpu' — which raises NotImplementedError on any meta tensor:
+        #   "Cannot copy out of meta tensor; no data! Please use to_empty()..."
+        #
+        # Fix A (sentence-transformers ≥ 3.x):
+        #   Pass model_kwargs={"low_cpu_mem_usage": False}; ST forwards it
+        #   directly to AutoModel.from_pretrained(), preventing meta tensors.
+        #
+        # Fix B (sentence-transformers 2.x, e.g. 2.3.1):
+        #   model_kwargs is not a recognised parameter — TypeError is raised.
+        #   Temporarily replace transformers.AutoModel.from_pretrained with a
+        #   thin wrapper that injects low_cpu_mem_usage=False, then restore it.
+        # -----------------------------------------------------------------------
+        try:
+            # sentence-transformers >= 3.x
+            _LOCAL_MODEL_CACHE[model_name] = SentenceTransformer(
+                model_name,
+                device='cpu',
+                model_kwargs={"low_cpu_mem_usage": False},
+            )
+        except TypeError:
+            # sentence-transformers 2.x — patch AutoModel temporarily
+            import transformers
+            _orig = transformers.AutoModel.from_pretrained
+
+            def _no_meta(*args, **kwargs):
+                kwargs["low_cpu_mem_usage"] = False
+                return _orig(*args, **kwargs)
+
+            transformers.AutoModel.from_pretrained = _no_meta
+            try:
+                _LOCAL_MODEL_CACHE[model_name] = SentenceTransformer(model_name, device='cpu')
+            finally:
+                # Always restore — even if SentenceTransformer.__init__ raises
+                transformers.AutoModel.from_pretrained = _orig
 
     model = _LOCAL_MODEL_CACHE[model_name]
     embeddings = model.encode(texts, show_progress_bar=False)

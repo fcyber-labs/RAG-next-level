@@ -42,12 +42,15 @@ def _get_local_embeddings(texts: List[str], model_name: str) -> List[List[float]
     if model_name not in _LOCAL_MODEL_CACHE:
         from sentence_transformers import SentenceTransformer  # lazy import — heavy load
         logger.info(f"Loading SentenceTransformer model: {model_name} (first use — caching for reuse)")
-        # Force CPU explicitly. Without this, newer transformers loads weights
-        # as meta-tensors (lazy/device-less) and SentenceTransformer.__init__
-        # immediately calls self.to(device), which crashes with:
+        # DO NOT pass device='cpu' — that forces self.to('cpu') inside __init__,
+        # which crashes on newer transformers that load weights as meta-tensors:
         #   NotImplementedError: Cannot copy out of meta tensor; no data!
-        # Pinning to CPU prevents the device-move entirely.
-        _LOCAL_MODEL_CACHE[model_name] = SentenceTransformer(model_name, device='cpu')
+        # model_kwargs={"low_cpu_mem_usage": False} prevents meta tensors from
+        # being created in the first place, so no .to() call is needed.
+        _LOCAL_MODEL_CACHE[model_name] = SentenceTransformer(
+            model_name,
+            model_kwargs={"low_cpu_mem_usage": False},
+        )
 
     model = _LOCAL_MODEL_CACHE[model_name]
     embeddings = model.encode(texts, show_progress_bar=False)

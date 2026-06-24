@@ -21,7 +21,7 @@ class TestReranker:
         
         reranker = Reranker(model_name='test-model')
         
-        mock_cross_encoder.assert_called_once_with('test-model', automodel_args={"low_cpu_mem_usage": False}, max_length=512)
+        mock_cross_encoder.assert_called_once_with('test-model')
         assert reranker.model == mock_model
     
     @patch('tasks.reranker.CrossEncoder')
@@ -32,7 +32,7 @@ class TestReranker:
         
         Reranker()
         
-        mock_cross_encoder.assert_called_once_with('cross-encoder/ms-marco-MiniLM-L-6-v2', automodel_args={"low_cpu_mem_usage": False}, max_length=512)
+        mock_cross_encoder.assert_called_once_with('cross-encoder/ms-marco-MiniLM-L-6-v2')
     
     @patch('tasks.reranker.CrossEncoder')
     def test_rerank_empty_results(self, mock_cross_encoder):

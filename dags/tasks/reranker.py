@@ -27,16 +27,7 @@ class Reranker:
             model_name: HuggingFace cross-encoder model name
         """
         logger.info(f"Loading reranker model: {model_name}")
-        # DO NOT pass device='cpu' — same meta-tensor crash as in embed.py.
-        # automodel_args={"low_cpu_mem_usage": False} is CrossEncoder's
-        # equivalent of SentenceTransformer's model_kwargs: it's forwarded
-        # to AutoModelForSequenceClassification.from_pretrained and prevents
-        # meta tensors from being created, so no .to(device) call fires.
-        self.model = CrossEncoder(
-            model_name,
-            automodel_args={"low_cpu_mem_usage": False},
-            max_length=512,
-        )
+        self.model = CrossEncoder(model_name)
         logger.info("Reranker model loaded successfully")
 
     def rerank(

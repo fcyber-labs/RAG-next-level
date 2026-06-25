@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 ENTRY_KEY_PREFIX  = "rag:semantic_answer:"
 INDEX_KEY_PREFIX  = "rag:semantic_index:"
 DEFAULT_TTL_SECONDS       = 5 * 60   # 5 minutes — same as chunk cache
-SIMILARITY_THRESHOLD      = 0.8     # cosine similarity to count as a hit
+SIMILARITY_THRESHOLD      = 0.95     # cosine similarity to count as a hit
 
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
@@ -179,8 +179,9 @@ def get_cached_answer(
                 f"(similarity={best_sim:.4f} ≥ {similarity_threshold})"
             )
             return {
-                "answer":     best_entry["answer"],
-                "cached_at":  best_entry["cached_at"],
+                "answer":    best_entry["answer"],
+                "results":   best_entry.get("results", []),   # retrieval results for display
+                "cached_at": best_entry["cached_at"],
                 "similarity": best_sim,
             }
 
@@ -203,11 +204,12 @@ def set_cached_answer(
     use_reranking: bool,
     top_k: int,
     answer: str,
+    results: List[Dict[str, Any]] = None,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
 ) -> None:
     """
     Store a freshly-generated LLM answer together with the query embedding
-    so future similar queries can match it semantically.
+    AND the retrieval results so future cache hits can skip Steps 3+4 entirely.
 
     The entry is registered in the index set for its (collection, settings)
     combination so invalidation can find and delete it.
@@ -226,6 +228,7 @@ def set_cached_answer(
             "answer":    answer,
             "embedding": query_embedding,
             "cached_at": time.time(),
+            "results":   results or [],   # stored for display on cache hit
             "settings":  {
                 "use_hybrid_search":   use_hybrid_search,
                 "use_query_rewriting": use_query_rewriting,

@@ -17,10 +17,28 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dags.tasks.embed import _get_local_embeddings
 from dags.tasks.hybrid_search import perform_hybrid_search
 import dags.tasks.query_rewriter as query_rewriter
-from dags.tasks.reranker import rerank_results
 from dags.utils.vector_store import get_qdrant_client, get_collection_info
 from dags.utils.chunk_cache import get_cached_chunks, set_cached_chunks, get_bm25_index, set_bm25_index
 from dags.utils.answer_cache import get_cached_answer, set_cached_answer
+
+
+# ── Streamlit-cached model loaders ───────────────────────────────────────────
+# @st.cache_resource loads once per app session and survives all reruns.
+# Without this, Streamlit can silently reload models on certain reruns even
+# when _LOCAL_MODEL_CACHE / _RERANKER_CACHE are populated, adding 5-15s.
+
+@st.cache_resource
+def _load_embedding_model(model_name: str):
+    """Load SentenceTransformer once; cache across all reruns."""
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer(model_name)
+
+
+@st.cache_resource
+def _load_reranker_model(model_name: str = 'cross-encoder/ms-marco-MiniLM-L-6-v2'):
+    """Load CrossEncoder once; cache across all reruns."""
+    from sentence_transformers import CrossEncoder
+    return CrossEncoder(model_name)
 
 # Try to import Groq for LLM answer generation
 try:
@@ -191,9 +209,9 @@ use_query_rewriting = st.sidebar.checkbox(
 )
 
 use_reranking = st.sidebar.checkbox(
-    "Use Reranking",
-    value=True,
-    help="Rerank results with cross-encoder"
+    "Use Reranking (slow on CPU ~5-8s)",
+    value=False,
+    help="Rerank results with cross-encoder. Accurate but adds 5-8s on CPU — disable for faster search."
 )
 
 use_llm_answer = st.sidebar.checkbox(
@@ -239,7 +257,23 @@ try:
     else:
         st.sidebar.warning(f"Collection '{collection_name}' not found")
 except Exception as e:
-    st.sidebar.error(f"Error: {e}")
+    st.sidebar.error(f"Qdrant error: {e}")
+
+# Sidebar - Redis / Cache Status
+st.sidebar.header("🗄️ Cache Status")
+try:
+    from dags.utils.hash_store import get_redis_client as _get_rc
+    _rc = _get_rc()
+    _rc.ping()
+    st.sidebar.success("Redis ✅ connected")
+    _bm25_key  = f"rag:bm25:{collection_name}"
+    _bm25_ok   = bool(_rc.exists(_bm25_key))
+    _ans_count = len(_rc.keys(f"rag:semantic_index:{collection_name}:*"))
+    st.sidebar.caption(f"BM25 index: {'✅ cached' if _bm25_ok else '❌ run pipeline first'}")
+    st.sidebar.caption(f"Cached answers: {_ans_count}"
+                       + (" (semantic cache ready)" if _ans_count > 0 else " (no hits yet)"))
+except Exception as _re:
+    st.sidebar.error(f"Redis ❌  {str(_re)[:60]}")
 
 # Sidebar - Search Timer
 st.sidebar.header("⏱ Performance")
@@ -282,7 +316,6 @@ if search_button and query:
                     for i, q in enumerate(queries, 1):
                         st.write(f"{i}. {q}")
                 
-                # Use first variation for search (or combine all)
                 search_query = queries[0]
             else:
                 search_query = query
@@ -290,112 +323,47 @@ if search_button and query:
             # Step 2: Generate embedding
             st.info("🧠 Generating embedding...")
             EMBEDDING_MODEL = os.getenv("RAG_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-            query_embedding = _get_local_embeddings([search_query], EMBEDDING_MODEL)[0]
-                        
-            # Step 3: Search
-            if use_hybrid_search:
-                # Fair split: ceil(top_k/2) dense + floor(top_k/2) sparse
-                import math as _math
-                _candidates = top_k * 2 if use_reranking else top_k
-                _dense_k  = _math.ceil(_candidates / 2)
-                _sparse_k = _candidates - _dense_k
-                st.info(f"🔍 Hybrid search: {_dense_k} dense (Qdrant) + {_sparse_k} sparse (BM25)…")
+            _embed_model    = _load_embedding_model(EMBEDDING_MODEL)   # cached by @st.cache_resource
+            query_embedding = _embed_model.encode([search_query], show_progress_bar=False).tolist()[0]
 
-                # Load pre-built BM25 index from Redis (warmed by Airflow's
-                # prepare_search_cache task after every upsert). On a cache
-                # hit the O(N) scroll + BM25 build are completely skipped,
-                # dropping latency from ~10s to ~2s.
-                bm25_index, all_chunks = get_bm25_index(collection_name)
-
-                if bm25_index is not None:
-                    st.caption(
-                        f"⚡ Pre-built BM25 index loaded from Redis "
-                        f"({len(all_chunks)} chunks)"
-                    )
-                else:
-                    # Cache miss — scroll Qdrant inline (fallback path).
-                    all_chunks = []
-                    offset = None
-                    while True:
-                        records, offset = client.scroll(
-                            collection_name=collection_name,
-                            limit=100,
-                            offset=offset,
-                            with_payload=True,
-                            with_vectors=False,
-                        )
-                        if not records:
-                            break
-                        for record in records:
-                            all_chunks.append({
-                                'id':      str(record.id),
-                                'text':    record.payload.get('text', ''),
-                                'payload': record.payload,
-                            })
-                        if offset is None:
-                            break
-                    set_cached_chunks(collection_name, all_chunks)
-                    # bm25_index stays None; perform_hybrid_search builds it inline
-
-                results = perform_hybrid_search(
-                    query=search_query,
-                    query_vector=query_embedding,
+            # ══════════════════════════════════════════════════════════════════
+            # Step 2.5: SEMANTIC CACHE CHECK — before ANY retrieval.
+            #
+            # Previously the cache check was in Step 5 (after hybrid search
+            # + reranking), so a "cache hit" still paid ~3-4s of retrieval
+            # cost. Moved here, a cache hit costs only:
+            #   embedding (~200ms) + Redis cosine scan (~10ms) → ~0.3s total.
+            # Steps 3 (retrieval), 4 (reranking), and 5 (LLM) are skipped.
+            # ══════════════════════════════════════════════════════════════════
+            _cache_hit = (
+                get_cached_answer(
                     collection_name=collection_name,
-                    chunks=all_chunks,
-                    bm25_index=bm25_index,
-                    top_k=_candidates,
+                    query_embedding=query_embedding,
+                    use_hybrid_search=use_hybrid_search,
+                    use_query_rewriting=use_query_rewriting,
+                    use_reranking=use_reranking,
+                    top_k=top_k,
                 )
-            else:
-                st.info("🔍 Performing vector search...")
-                from dags.utils.vector_store import search_similar
-                results = search_similar(
-                    collection_name=collection_name,
-                    query_vector=query_embedding,
-                    limit=top_k * 2 if use_reranking else top_k
-                )
-            
-            # Step 4: Reranking (optional)
-            if use_reranking and results:
-                st.info("📊 Reranking results...")
-                results = rerank_results(
-                    query=search_query,
-                    results=results,
-                    top_k=top_k
-                )
-            else:
-                results = results[:top_k]
-            
-            # Step 5: Generate and Display LLM Answer (optional)
-            if use_llm_answer and results:
-                st.markdown("---")
-                st.subheader("💡 Answer")
-                
-                # Create a placeholder for streaming
-                answer_placeholder = st.empty()
+                if use_answer_cache else None
+            )
 
-                # Semantic cache check — uses the embedding already computed
-                # in Step 2 (no extra model call). Finds any stored answer
-                # whose query embedding is within similarity_threshold of
-                # the current query's embedding, regardless of exact wording.
-                cached = (
-                    get_cached_answer(
-                        collection_name=collection_name,
-                        query_embedding=query_embedding,
-                        use_hybrid_search=use_hybrid_search,
-                        use_query_rewriting=use_query_rewriting,
-                        use_reranking=use_reranking,
-                        top_k=top_k,
-                    )
-                    if use_answer_cache else None
+            _timer_stopped = False   # track whether we've already written latency
+
+            if _cache_hit is not None:
+                # ── FAST PATH ──────────────────────────────────────────────
+                results     = _cache_hit.get('results', [])
+                age_seconds = max(0, int(time.time() - _cache_hit.get('cached_at', time.time())))
+                similarity  = _cache_hit.get('similarity', 1.0)
+                _cache_label = (
+                    f"⚡ Semantic cache hit — similarity {similarity:.3f} · "
+                    f"generated {age_seconds}s ago · "
+                    f"retrieval + reranking + LLM skipped"
                 )
 
-                if cached is not None:
-                    # ⚡ CACHE HIT — no LLM call, no streaming. This is
-                    # surfaced explicitly so it's never mistaken for a
-                    # live generation.
-                    age_seconds = max(0, int(time.time() - cached.get('cached_at', time.time())))
-                    similarity  = cached.get('similarity', 1.0)
-                    answer_placeholder.markdown(
+                if use_llm_answer:
+                    st.markdown("---")
+                    st.subheader("💡 Answer")
+                    st.markdown(
                         f"""
                         <div style="
                             background-color: #d4edda;
@@ -405,108 +373,206 @@ if search_button and query:
                             color: #155724;
                             font-size: 16px;
                         ">
-                        {cached['answer']}
+                        {_cache_hit['answer']}
                         </div>
                         """,
                         unsafe_allow_html=True
                     )
-                    # ⏱ Timer stops here — cache hit is the last output
-                    _elapsed = time.time() - _t0
-                    st.session_state.last_elapsed = _elapsed
-                    _timer_slot.metric("Last Search Latency", f"{_elapsed:.2f}s")
-                    st.caption(f"⚡ Semantic cache hit (similarity={similarity:.3f}, generated {age_seconds}s ago) — LLM was not called")
-                elif use_streaming:
-                    # ✅ STREAMING MODE - shows answer as it's generated
-                    full_answer = ""
-                    for chunk in generate_answer_stream(query, results):
-                        full_answer += chunk
-                        # Update the placeholder with the current answer
-                        answer_placeholder.markdown(
-                            f"""
-                            <div style="
-                                background-color: #d4edda;
-                                padding: 20px;
-                                border-radius: 10px;
-                                border-left: 5px solid #28a745;
-                                color: #155724;
-                                font-size: 16px;
-                            ">
-                            {full_answer}
-                            </div>
-                            """,
-                            unsafe_allow_html=True
-                        )
-                    # ⏱ Timer stops here — last symbol of the streamed answer
-                    _elapsed = time.time() - _t0
-                    st.session_state.last_elapsed = _elapsed
-                    _timer_slot.metric("Last Search Latency", f"{_elapsed:.2f}s")
-                    if use_answer_cache:
-                        set_cached_answer(
-                            collection_name=collection_name,
-                            query_embedding=query_embedding,
-                            use_hybrid_search=use_hybrid_search,
-                            use_query_rewriting=use_query_rewriting,
-                            use_reranking=use_reranking,
-                            top_k=top_k,
-                            answer=full_answer,
-                        )
+                    # Badge sits directly under the answer where the user looks
+                    st.caption(_cache_label)
+                    if results:
+                        with st.expander("📚 View Sources"):
+                            for idx, result in enumerate(results[:3], 1):
+                                payload = result.get("payload", {})
+                                st.write(
+                                    f"**Source {idx}:** "
+                                    f"{payload.get('filename', 'unknown')} "
+                                    f"(Score: {result.get('combined_score', result.get('score', 0)):.3f})"
+                                )
                 else:
-                    # Non-streaming mode - generate all at once
-                    with st.spinner("🤖 Generating answer..."):
-                        answer = generate_answer(query, results)
-                        # ✅ FIX: Green box with the answer
-                        answer_placeholder.markdown(
-                            f"""
-                            <div style="
-                                background-color: #d4edda;
-                                padding: 20px;
-                                border-radius: 10px;
-                                border-left: 5px solid #28a745;
-                                color: #155724;
-                                font-size: 16px;
-                            ">
-                            {answer}
-                            </div>
-                            """,
-                            unsafe_allow_html=True
-                        )
-                    # ⏱ Timer stops here — non-streaming answer is the last output
-                    _elapsed = time.time() - _t0
-                    st.session_state.last_elapsed = _elapsed
-                    _timer_slot.metric("Last Search Latency", f"{_elapsed:.2f}s")
-                    if use_answer_cache:
-                        set_cached_answer(
-                            collection_name=collection_name,
-                            query_embedding=query_embedding,
-                            use_hybrid_search=use_hybrid_search,
-                            use_query_rewriting=use_query_rewriting,
-                            use_reranking=use_reranking,
-                            top_k=top_k,
-                            answer=answer,
-                        )
-                
-                # Show sources after the answer
-                with st.expander("📚 View Sources"):
-                    for idx, result in enumerate(results[:3], 1):
-                        payload = result.get("payload", {})
-                        st.write(
-                            f"**Source {idx}:** "
-                            f"{payload.get('filename', 'unknown')} "
-                            f"(Score: {result.get('combined_score', result.get('score', 0)):.3f})"
-                        )
+                    # No answer box above — show the badge as a banner
+                    st.success(_cache_label)
 
-            # Display Results
+                # Timer stops here — fastest path
+                _elapsed = time.time() - _t0
+                st.session_state.last_elapsed = _elapsed
+                _timer_slot.metric("Last Search Latency", f"{_elapsed:.2f}s")
+                _timer_stopped = True
+
+            else:
+                # ── FULL PIPELINE PATH ─────────────────────────────────────
+                # Step 3: Search
+                if use_hybrid_search:
+                    import math as _math
+                    _candidates = top_k * 2 if use_reranking else top_k
+                    _dense_k  = _math.ceil(_candidates / 2)
+                    _sparse_k = _candidates - _dense_k
+                    if use_reranking:
+                        st.info(f"🔍 Hybrid search: {_dense_k} dense + {_sparse_k} sparse candidates → reranking → top {top_k}…")
+                    else:
+                        st.info(f"🔍 Hybrid search: {_dense_k} dense + {_sparse_k} sparse → top {top_k}…")
+
+                    bm25_index, all_chunks = get_bm25_index(collection_name)
+
+                    if bm25_index is not None:
+                        st.caption(
+                            f"⚡ Pre-built BM25 index loaded from Redis "
+                            f"({len(all_chunks)} chunks)"
+                        )
+                    else:
+                        all_chunks = []
+                        offset = None
+                        while True:
+                            records, offset = client.scroll(
+                                collection_name=collection_name,
+                                limit=100,
+                                offset=offset,
+                                with_payload=True,
+                                with_vectors=False,
+                            )
+                            if not records:
+                                break
+                            for record in records:
+                                all_chunks.append({
+                                    'id':      str(record.id),
+                                    'text':    record.payload.get('text', ''),
+                                    'payload': record.payload,
+                                })
+                            if offset is None:
+                                break
+                        set_cached_chunks(collection_name, all_chunks)
+
+                    results = perform_hybrid_search(
+                        query=search_query,
+                        query_vector=query_embedding,
+                        collection_name=collection_name,
+                        chunks=all_chunks,
+                        bm25_index=bm25_index,
+                        top_k=_candidates,
+                    )
+                else:
+                    st.info("🔍 Performing vector search...")
+                    from dags.utils.vector_store import search_similar
+                    results = search_similar(
+                        collection_name=collection_name,
+                        query_vector=query_embedding,
+                        limit=top_k * 2 if use_reranking else top_k
+                    )
+
+                # Step 4: Reranking (optional — CrossEncoder on CPU adds ~5-8s)
+                if use_reranking and results:
+                    st.info("📊 Reranking results...")
+                    _reranker = _load_reranker_model()   # cached by @st.cache_resource
+                    _pairs    = [
+                        [search_query, r.get('payload', {}).get('text', r.get('text', ''))]
+                        for r in results
+                    ]
+                    _scores = _reranker.predict(_pairs)
+                    for r, s in zip(results, _scores):
+                        r['reranker_score'] = float(s)
+                    results = sorted(results, key=lambda x: x.get('reranker_score', 0), reverse=True)[:top_k]
+                else:
+                    results = results[:top_k]
+
+                # Step 5: Generate and Display LLM Answer (optional)
+                if use_llm_answer and results:
+                    st.markdown("---")
+                    st.subheader("💡 Answer")
+                    answer_placeholder = st.empty()
+
+                    if use_streaming:
+                        full_answer = ""
+                        for chunk in generate_answer_stream(query, results):
+                            full_answer += chunk
+                            answer_placeholder.markdown(
+                                f"""
+                                <div style="
+                                    background-color: #d4edda;
+                                    padding: 20px;
+                                    border-radius: 10px;
+                                    border-left: 5px solid #28a745;
+                                    color: #155724;
+                                    font-size: 16px;
+                                ">
+                                {full_answer}
+                                </div>
+                                """,
+                                unsafe_allow_html=True
+                            )
+                        # Timer stops after last streamed character
+                        _elapsed = time.time() - _t0
+                        st.session_state.last_elapsed = _elapsed
+                        _timer_slot.metric("Last Search Latency", f"{_elapsed:.2f}s")
+                        _timer_stopped = True
+                        if use_answer_cache:
+                            set_cached_answer(
+                                collection_name=collection_name,
+                                query_embedding=query_embedding,
+                                use_hybrid_search=use_hybrid_search,
+                                use_query_rewriting=use_query_rewriting,
+                                use_reranking=use_reranking,
+                                top_k=top_k,
+                                answer=full_answer,
+                                results=results,
+                            )
+                    else:
+                        with st.spinner("🤖 Generating answer..."):
+                            answer = generate_answer(query, results)
+                            answer_placeholder.markdown(
+                                f"""
+                                <div style="
+                                    background-color: #d4edda;
+                                    padding: 20px;
+                                    border-radius: 10px;
+                                    border-left: 5px solid #28a745;
+                                    color: #155724;
+                                    font-size: 16px;
+                                ">
+                                {answer}
+                                </div>
+                                """,
+                                unsafe_allow_html=True
+                            )
+                        # Timer stops after answer fully rendered
+                        _elapsed = time.time() - _t0
+                        st.session_state.last_elapsed = _elapsed
+                        _timer_slot.metric("Last Search Latency", f"{_elapsed:.2f}s")
+                        _timer_stopped = True
+                        if use_answer_cache:
+                            set_cached_answer(
+                                collection_name=collection_name,
+                                query_embedding=query_embedding,
+                                use_hybrid_search=use_hybrid_search,
+                                use_query_rewriting=use_query_rewriting,
+                                use_reranking=use_reranking,
+                                top_k=top_k,
+                                answer=answer,
+                                results=results,
+                            )
+
+                    with st.expander("📚 View Sources"):
+                        for idx, result in enumerate(results[:3], 1):
+                            payload = result.get("payload", {})
+                            st.write(
+                                f"**Source {idx}:** "
+                                f"{payload.get('filename', 'unknown')} "
+                                f"(Score: {result.get('combined_score', result.get('score', 0)):.3f})"
+                            )
+
+            # ── Results display (both cache-hit and full-pipeline paths) ──
             st.markdown("---")
             st.subheader(f"📄 Retrieved {len(results)} Results")
-            
+
             if not results:
                 st.warning("No results found. Try a different query.")
             else:
                 for idx, result in enumerate(results, 1):
-                    with st.expander(f"**Result #{idx}** - Score: {result.get('combined_score', result.get('score', 0)):.4f}", expanded=(idx == 1 and not use_llm_answer)):
-                        # Metadata
+                    with st.expander(
+                        f"**Result #{idx}** - Score: {result.get('combined_score', result.get('score', 0)):.4f}",
+                        expanded=(idx == 1 and not use_llm_answer)
+                    ):
                         payload = result.get('payload', {})
-                        
+
                         col1, col2, col3 = st.columns(3)
                         with col1:
                             st.caption(f"**Source:** {payload.get('source', 'unknown')}")
@@ -514,16 +580,12 @@ if search_button and query:
                             st.caption(f"**File:** {payload.get('filename', 'unknown')}")
                         with col3:
                             st.caption(f"**Chunk:** {payload.get('chunk_index', '?')} / {payload.get('total_chunks', '?')}")
-                        
-                        # Text content
+
                         st.markdown("**Text:**")
-                        text = payload.get('text', result.get('text', 'No text available'))
-                        st.write(text)
-                        
-                        # Scores breakdown
+                        st.write(payload.get('text', result.get('text', 'No text available')))
+
                         st.markdown("**Scores:**")
                         score_cols = st.columns(4)
-                        
                         if 'vector_score' in result:
                             score_cols[0].metric("Vector", f"{result['vector_score']:.3f}")
                         if 'bm25_score' in result:
@@ -532,23 +594,18 @@ if search_button and query:
                             score_cols[2].metric("Combined", f"{result['combined_score']:.3f}")
                         if 'reranker_score' in result:
                             score_cols[3].metric("Reranker", f"{result['reranker_score']:.3f}")
-                        
-                        # Additional metadata
+
                         st.divider()
                         st.markdown("### Full Metadata")
                         st.json(payload)
 
-            # ⏱ Timer stop for the no-LLM path — results display is the last output.
-            # (When LLM answer is enabled the timer is stopped inside the
-            # streaming/non-streaming/cache branches above, so this is a
-            # safe no-op in that case because last_elapsed is already set.)
-            if not use_llm_answer or not results:
+            # Final timer stop — no-LLM path or any path not yet stopped
+            if not _timer_stopped:
                 _elapsed = time.time() - _t0
                 st.session_state.last_elapsed = _elapsed
                 _timer_slot.metric("Last Search Latency", f"{_elapsed:.2f}s")
-        
+
         except Exception as e:
-            # ⏱ Stop timer even on error
             _elapsed = time.time() - _t0
             st.session_state.last_elapsed = _elapsed
             _timer_slot.metric("Last Search Latency", f"{_elapsed:.2f}s ❌")
@@ -571,7 +628,6 @@ elif search_button and not query:
     st.warning("Please enter a query to search.")
 
 
-# Footer
 st.markdown("---")
 st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 st.caption("Powered by Qdrant + OpenAI + Airflow")

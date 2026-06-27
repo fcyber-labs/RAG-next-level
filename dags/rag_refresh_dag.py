@@ -19,6 +19,7 @@ from tasks.upsert_vectors import upsert_to_qdrant
 from tasks.run_eval import run_retrieval_evaluation
 from tasks.rollback import rollback_collection, promote_collection
 from tasks.prepare_search_cache import prepare_search_cache
+from tasks.cost_analysis import run_cost_analysis
 
 # Import NEW enhanced tasks
 #from tasks.hybrid_search import perform_hybrid_search
@@ -28,11 +29,6 @@ from tasks.prepare_search_cache import prepare_search_cache
 # Import utilities
 from utils.slack_notifier import send_pipeline_summary, send_alert
 from utils.mlflow_logger import start_mlflow_run, log_pipeline_metrics  # now lazy-import mlflow
-from utils.cost_predictor import (
-    predict_monthly_cost,
-    get_historical_costs_from_prometheus,
-    generate_cost_budget_alert,
-)
 from utils.metadata_db import log_ingestion_start, log_ingestion_complete
 
 # Default arguments
@@ -168,6 +164,7 @@ with dag:
             'model_name': "{{ params.embedding_model }}",
             'batch_size': 100,
         },
+        provide_context=True,
     )
 
     # ============================================
@@ -215,51 +212,17 @@ with dag:
     )
 
     # ============================================
-    # Stage 7: Cost Prediction
+    # Stage 7: Cost Analysis & Budget Forecast
+    # scikit-learn regression → MLflow + Redis
     # ============================================
-
-    def predict_costs(**context):
-        """Predict monthly costs and check budget."""
-        current_cost = (
-            context['task_instance'].xcom_pull(
-                task_ids='embed_chunks', key='embedding_cost'
-            )
-            or 0.0
-        )
-
-        historical_costs = get_historical_costs_from_prometheus(days_back=30)
-
-        if historical_costs:
-            prediction = predict_monthly_cost(historical_costs, days_to_predict=30)
-            budget_limit = float(context['params']['cost_budget_monthly'])
-            alert = generate_cost_budget_alert(
-                current_cost=current_cost,
-                predicted_monthly_cost=prediction['monthly_estimate'],
-                budget_limit=budget_limit,
-            )
-
-            try:
-                import mlflow
-                mlflow.log_metric('predicted_monthly_cost', prediction['monthly_estimate'])
-                mlflow.log_metric('cost_budget_utilization', alert['utilization'])
-            except Exception:
-                pass
-
-            if alert['severity'] in ['warning', 'critical']:
-                try:
-                    from utils.slack_notifier import _send_slack_message
-                    color = 'warning' if alert['severity'] == 'warning' else 'danger'
-                    _send_slack_message(alert['message'], color=color)
-                except Exception:
-                    pass
-
-            return prediction
-        else:
-            return {'message': 'Not enough historical data'}
 
     cost_prediction = PythonOperator(
         task_id='predict_monthly_costs',
-        python_callable=predict_costs,
+        python_callable=run_cost_analysis,
+        op_kwargs={
+            'collection_name': 'knowledge_base_staging',
+            'budget_limit':    "{{ params.cost_budget_monthly }}",
+        },
         provide_context=True,
     )
 

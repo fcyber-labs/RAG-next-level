@@ -128,15 +128,24 @@ def embed_chunks(
     )
 
     # Export metrics (lazy import — metrics_exporter is always available)
+    total_cost = 0.0
     try:
         from utils.metrics_exporter import export_counter, export_histogram
         export_counter('chunks_embedded_total', len(embedded_chunks))
         export_histogram('embedding_latency_seconds', elapsed)
         if is_openai and total_tokens > 0:
-            cost = (total_tokens / 1_000_000) * 0.02  # $0.02 per 1M tokens
-            export_counter('embedding_cost_usd', cost)
-            logger.info(f"Estimated OpenAI cost: ${cost:.4f}")
+            total_cost = (total_tokens / 1_000_000) * 0.02  # $0.02 per 1M tokens
+            export_counter('embedding_cost_usd', total_cost)
+            logger.info(f"Estimated OpenAI cost: ${total_cost:.4f}")
     except Exception as e:
         logger.warning(f"Could not export metrics: {e}")
+
+    # Push cost to XCom so the cost_analysis task can read it downstream.
+    # Works for both OpenAI (real cost) and local models ($0.00 — correct,
+    # local inference has no per-token API charge).
+    ti = kwargs.get('task_instance') or kwargs.get('ti')
+    if ti is not None:
+        ti.xcom_push(key='embedding_cost', value=round(total_cost, 6))
+        logger.debug(f"Pushed embedding_cost={total_cost:.6f} to XCom")
 
     return embedded_chunks

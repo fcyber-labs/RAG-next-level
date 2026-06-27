@@ -96,6 +96,14 @@ services:
 
   redis:
     image: redis:7.2-alpine
+    # Disable RDB snapshots and AOF so Redis always starts with an empty
+    # database. Without this, pickled BM25 indexes and chunk-list caches
+    # survive container restarts and can crash on deserialization if library
+    # versions changed between restarts — forcing the manual FLUSHDB the user
+    # was running before every restart. Ephemeral Redis is correct here: all
+    # caches self-heal on the first pipeline run (prepare_search_cache) or
+    # first search (fallback scroll + build).
+    command: redis-server --save "" --appendonly no
     expose:
       - 6379
     healthcheck:
@@ -105,8 +113,6 @@ services:
       retries: 50
       start_period: 30s
     restart: always
-    volumes:
-      - redis-data:/data
 
   qdrant:
     image: qdrant/qdrant:v1.7.4

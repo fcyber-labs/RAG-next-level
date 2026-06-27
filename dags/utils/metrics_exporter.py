@@ -161,6 +161,21 @@ average_chunks_per_document_gauge = Gauge(
 )
 
 
+def _auto_push() -> None:
+    """
+    Push all current metrics to Prometheus Pushgateway.
+
+    Called automatically after every export_* call so metrics always reach
+    Prometheus without requiring each task to explicitly call push_metrics().
+    Failures are silently swallowed — Prometheus being down must NEVER block
+    an Airflow task from completing.
+    """
+    try:
+        push_to_gateway(PUSHGATEWAY_URL, job='rag_pipeline', registry=registry)
+    except Exception as e:
+        logger.debug(f"Pushgateway push failed (non-fatal): {e}")
+
+
 def export_counter(metric_name: str, value: float):
     """
     Export a counter metric to Prometheus.
@@ -188,6 +203,7 @@ def export_counter(metric_name: str, value: float):
         if counter:
             counter.inc(value)
             logger.debug(f"Incremented counter {metric_name} by {value}")
+            _auto_push()
         else:
             logger.warning(f"Unknown counter metric name '{metric_name}' — value not exported")
     
@@ -221,6 +237,7 @@ def export_gauge(metric_name: str, value: float):
         if gauge:
             gauge.set(value)
             logger.debug(f"Set gauge {metric_name} to {value}")
+            _auto_push()
         else:
             logger.warning(f"Unknown gauge metric name '{metric_name}' — value not exported")
     
@@ -249,6 +266,7 @@ def export_histogram(metric_name: str, value: float):
         if histogram:
             histogram.observe(value)
             logger.debug(f"Observed {value} for histogram {metric_name}")
+            _auto_push()
         else:
             logger.warning(f"Unknown histogram metric name '{metric_name}' — value not exported")
     

@@ -6,33 +6,21 @@ global:
   external_labels:
     monitor: 'rag-pipeline-monitor'
 
-# Scrape configurations
 scrape_configs:
   # Prometheus itself
   - job_name: 'prometheus'
     static_configs:
       - targets: ['localhost:9090']
 
-  # Pushgateway for batch job metrics
+  # Pushgateway — Airflow tasks push RAG pipeline metrics here.
+  # honor_labels preserves the job/instance labels set by the pushing task.
   - job_name: 'pushgateway'
     honor_labels: true
     static_configs:
       - targets: ['prometheus-pushgateway:9091']
 
-  # Airflow metrics (if exposed)
-  - job_name: 'airflow'
-    static_configs:
-      - targets: ['airflow-webserver:8080']
-    metrics_path: '/admin/metrics'
-
-  # Qdrant metrics
+  # Qdrant vector database metrics
   - job_name: 'qdrant'
     static_configs:
       - targets: ['qdrant:6333']
     metrics_path: '/metrics'
-
-# Alerting rules (optional)
-# alerting:
-#   alertmanagers:
-#     - static_configs:
-#         - targets: ['alertmanager:9093']

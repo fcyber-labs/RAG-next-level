@@ -167,3 +167,21 @@ def get_hash_stats() -> dict:
     except redis.RedisError as e:
         logger.error(f"Error getting hash stats: {e}")
         return {'total_hashes': 0, 'memory_used_bytes': 0}
+
+
+def check_document_hash(redis_client, content_hash: str, ttl: int = 2_592_000) -> bool:
+    """
+    Check if a document hash already exists in Redis.
+
+    Returns True  → duplicate, skip this document.
+    Returns False → new document; hash is stored automatically with the given TTL.
+
+    Args:
+        redis_client: an active Redis client instance
+        content_hash: SHA-256 string from compute_content_hash()
+        ttl:          seconds until the key expires (default = 30 days)
+    """
+    key = f"rag:doc_hash:{content_hash}"
+    # SET NX = set only if key does not exist; returns True if key was NEW
+    is_new = redis_client.set(key, "1", ex=ttl, nx=True)
+    return not is_new   # True = already existed = duplicate

@@ -2,6 +2,24 @@
 Test DAG integrity - ensures DAG loads without errors.
 Simple tests for a junior engineer to understand DAG validation.
 """
+
+import os
+import sqlalchemy
+
+# Tell Airflow to use an in-memory SQLite so it doesn't need a real DB
+os.environ.setdefault("AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", "sqlite:////tmp/airflow_test.db")
+os.environ.setdefault("AIRFLOW__CORE__LOAD_EXAMPLES", "false")
+os.environ.setdefault("AIRFLOW_HOME", "/tmp/airflow_test")
+
+# Airflow 2.8.1 passes encoding='utf-8' to create_engine(), which SQLAlchemy 2.x
+# removed. Patch it out here before airflow is imported.
+_orig = sqlalchemy.create_engine
+def _create_engine_compat(*args, **kwargs):
+    kwargs.pop("encoding", None)
+    return _orig(*args, **kwargs)
+sqlalchemy.create_engine = _create_engine_compat
+
+
 from airflow.models import DagBag
 import logging
 

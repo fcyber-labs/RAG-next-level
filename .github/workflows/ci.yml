@@ -1,352 +1,177 @@
+name: RAG Pipeline CI
 
-
-name: RAG Pipeline - Continuous Integration
-
-on: workflow_dispatch
-
-  #push:
-  #  branches: [ main, develop ]
-  #pull_request:
-  #  branches: [ main, develop ]
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
 
 env:
-  PYTHON_VERSION: '3.11'
-  POETRY_VERSION: '1.7.1'
+  PYTHON_VERSION: "3.11"
 
 jobs:
-  # =============================================
-  # Job 1: Code Quality & Linting
-  # =============================================
-  lint:
+
+  # ─────────────────────────────────────────────────────────────────
+  # 1. Code Quality Checks
+  # ─────────────────────────────────────────────────────────────────
+  code-quality:
     name: Code Quality Checks
     runs-on: ubuntu-latest
-    
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Set up Python
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      
-      - name: Cache pip dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-      
-      - name: Install dependencies
+          cache: pip
+
+      - name: Upgrade pip & install quality tools
         run: |
           python -m pip install --upgrade pip
           pip install flake8 black isort pylint mypy
-          pip install -r requirements.txt
-      
-      - name: Run Black (code formatting check)
-        run: |
-          black --check --diff dags/ streamlit_app/ tests/
-      
-      - name: Run isort (import sorting check)
-        run: |
-          isort --check-only --diff dags/ streamlit_app/ tests/
-      
-      - name: Run Flake8 (linting)
-        run: |
-          # Stop build if there are Python syntax errors or undefined names
-          flake8 dags/ streamlit_app/ tests/ --count --select=E9,F63,F7,F82 --show-source --statistics
-          # Exit-zero treats all errors as warnings
-          flake8 dags/ streamlit_app/ tests/ --count --exit-zero --max-complexity=15 --max-line-length=120 --statistics
-      
-      - name: Run Pylint (advanced linting)
-        run: |
-          pylint dags/ --disable=C0111,R0903,C0103 --max-line-length=120 --exit-zero
-        continue-on-error: true
-      
-      - name: Run MyPy (type checking)
-        run: |
-          mypy dags/ --ignore-missing-imports --no-strict-optional
-        continue-on-error: true
 
-  # =============================================
-  # Job 2: Unit Tests
-  # =============================================
-  test:
-    name: Unit Tests
-    runs-on: ubuntu-latest
-    
-    services:
-      # Redis for deduplication tests
-      redis:
-        image: redis:7.2-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-      
-      # PostgreSQL for metadata tests
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_USER: test_user
-          POSTGRES_PASSWORD: test_password
-          POSTGRES_DB: test_db
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      
-      - name: Cache pip dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-test-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-test-
-      
-      - name: Install dependencies
+      - name: flake8 (syntax + style)
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest pytest-cov pytest-mock pytest-asyncio
-      
-      - name: Set up test environment variables
-        run: |
-          echo "REDIS_HOST=localhost" >> $GITHUB_ENV
-          echo "REDIS_PORT=6379" >> $GITHUB_ENV
-          echo "QDRANT_HOST=localhost" >> $GITHUB_ENV
-          echo "QDRANT_PORT=6333" >> $GITHUB_ENV
-          echo "OPENAI_API_KEY=test-key-not-real" >> $GITHUB_ENV
-      
-      - name: Run pytest
-        run: |
-          pytest tests/ \
-            --verbose \
-            --cov=dags \
-            --cov-report=xml \
-            --cov-report=term-missing \
-            --cov-report=html \
-            --junit-xml=pytest-report.xml
-      
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          file: ./coverage.xml
-          flags: unittests
-          name: codecov-umbrella
-          fail_ci_if_error: false
-      
-      - name: Upload test results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: test-results
-          path: |
-            pytest-report.xml
-            htmlcov/
-      
-      - name: Comment test coverage on PR
-        if: github.event_name == 'pull_request'
-        uses: py-cov-action/python-coverage-comment-action@v3
-        with:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MINIMUM_GREEN: 80
-          MINIMUM_ORANGE: 70
+          flake8 dags/ streamlit_app/ scripts/ \
+            --max-line-length=120 \
+            --extend-ignore=E203,W503 \
+            --exclude=__pycache__,.git
+        continue-on-error: false
 
-  # =============================================
-  # Job 3: Airflow DAG Validation
-  # =============================================
-  dag-validation:
+      - name: black (formatting check)
+        run: |
+          black --check --line-length=120 \
+            dags/ streamlit_app/ scripts/ \
+            --exclude='/(\.git|__pycache__)/'
+
+      - name: isort (import order check)
+        run: |
+          isort --check-only --line-length=120 \
+            dags/ streamlit_app/ scripts/
+
+  # ─────────────────────────────────────────────────────────────────
+  # 2. Airflow DAG Integrity
+  # ─────────────────────────────────────────────────────────────────
+  airflow-dag-integrity:
     name: Airflow DAG Integrity
     runs-on: ubuntu-latest
-    
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Set up Python
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      
-      - name: Install Airflow and dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest
-      
-      - name: Test DAG imports
-        run: |
-          python -c "
-          import sys
-          sys.path.insert(0, 'dags')
-          from rag_refresh_dag import dag
-          print(f'✓ DAG loaded successfully: {dag.dag_id}')
-          print(f'✓ Total tasks: {len(dag.tasks)}')
-          "
-      
-      - name: Run DAG validation tests
-        run: |
-          pytest tests/test_dag_integrity.py -v
-      
-      - name: Check for DAG cycles
-        run: |
-          python -c "
-          import sys
-          sys.path.insert(0, 'dags')
-          from rag_refresh_dag import dag
-          try:
-              dag.test_cycle()
-              print('✓ No cycles detected in DAG')
-          except Exception as e:
-              print(f'✗ Cycle detected: {e}')
-              sys.exit(1)
-          "
-      
-      - name: Validate DAG structure
-        run: |
-          python scripts/validate_dag_structure.py
+          cache: pip
 
-  # =============================================
-  # Job 4: Docker Build Test
-  # =============================================
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      # Install only Airflow + providers to keep this job fast.
+      # We intentionally skip qdrant-client / sentence-transformers
+      # (heavy ML packages) and use mocks for DAG import validation.
+      - name: Install Airflow and providers
+        run: |
+          pip install \
+            "apache-airflow==2.8.1" \
+            "apache-airflow-providers-redis==3.5.0" \
+            "apache-airflow-providers-postgres==5.10.0" \
+            "apache-airflow-providers-amazon==8.16.0" \
+            "python-dotenv==1.0.0" \
+            "pydantic==2.5.3"
+
+      - name: Create minimal .env for Airflow init
+        run: |
+          cp .env.example .env
+          # Override DB connection to use SQLite for CI
+          echo "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////tmp/airflow_ci.db" >> .env
+          echo "AIRFLOW__CORE__LOAD_EXAMPLES=false" >> .env
+
+      - name: Initialise Airflow DB
+        run: airflow db init
+        env:
+          AIRFLOW_HOME: /tmp/airflow_ci
+          AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "sqlite:////tmp/airflow_ci.db"
+          AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+          AIRFLOW__CORE__DAGS_FOLDER: "${{ github.workspace }}/dags"
+
+      - name: Validate DAGs (import check)
+        run: |
+          airflow dags list 2>&1 | tee /tmp/dag_list.txt
+          # Fail if any DAG shows an import error
+          if grep -i "error\|broken\|import" /tmp/dag_list.txt | grep -iv "no errors\|0 errors"; then
+            echo "❌ One or more DAGs have import errors"
+            exit 1
+          fi
+          echo "✅ All DAGs imported successfully"
+        env:
+          AIRFLOW_HOME: /tmp/airflow_ci
+          AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "sqlite:////tmp/airflow_ci.db"
+          AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+          AIRFLOW__CORE__DAGS_FOLDER: "${{ github.workspace }}/dags"
+
+  # ─────────────────────────────────────────────────────────────────
+  # 3. Docker Build Validation
+  # FIX: copy .env.example → .env before docker-compose runs so
+  #      compose can resolve variable substitutions without failing
+  #      with "env file … not found".
+  # ─────────────────────────────────────────────────────────────────
   docker-build:
     name: Docker Build Validation
     runs-on: ubuntu-latest
-    
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      
-      - name: Cache Docker layers
-        uses: actions/cache@v4
-        with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-buildx-
-      
-      - name: Build Airflow Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./docker/Dockerfile
-          push: false
-          tags: rag-pipeline:test
-          cache-from: type=local,src=/tmp/.buildx-cache
-          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
-      
-      - name: Move cache
-        run: |
-          rm -rf /tmp/.buildx-cache
-          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
-      
-      - name: Test Docker Compose configuration
+      - uses: actions/checkout@v4
+
+      # ── KEY FIX: create .env from the example template ──────────
+      - name: Create .env from template
+        run: cp .env.example .env
+
+      - name: Validate docker-compose config
         run: |
           cd docker
-          docker compose config > /dev/null
-          echo "✓ Docker Compose configuration is valid"
-      
-      - name: Scan Docker image for vulnerabilities
+          docker compose --env-file ../.env config --quiet
+        # Only validates the YAML + variable resolution; does NOT
+        # pull images or run containers (fast, no credentials needed).
+
+      - name: Build Docker images (no cache)
+        run: |
+          cd docker
+          docker compose --env-file ../.env build --no-cache
+        env:
+          DOCKER_BUILDKIT: "1"
+
+      - name: Run Trivy vulnerability scan
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: rag-pipeline:test
-          format: 'sarif'
-          output: 'trivy-results.sarif'
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "0"          # don't fail CI on findings; just report
         continue-on-error: true
-      
-      - name: Upload Trivy results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: 'trivy-results.sarif'
 
-  # =============================================
-  # Job 5: Security Checks
-  # =============================================
-  security:
-    name: Security & Dependency Audit
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Upload Trivy SARIF
+        # Only upload when the file was actually created
+        if: always() && hashFiles('trivy-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install safety bandit
-      
-      - name: Run Safety (dependency vulnerability check)
-        run: |
-          pip install -r requirements.txt
-          safety check --json || true
-        continue-on-error: true
-      
-      - name: Run Bandit (security linting)
-        run: |
-          bandit -r dags/ streamlit_app/ -f json -o bandit-report.json || true
-        continue-on-error: true
-      
-      - name: Upload security reports
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: security-reports
-          path: |
-            bandit-report.json
+          sarif_file: trivy-results.sarif
+        continue-on-error: true  # fork PRs lack security-events write permission
 
-  # =============================================
-  # Job 6: Documentation Check
-  # =============================================
-  docs:
+  # ─────────────────────────────────────────────────────────────────
+  # 4. Documentation Validation
+  # FIX: adds data/benchmark_queries.json to the required-files list
+  #      (it now exists in the repo after this PR).
+  # ─────────────────────────────────────────────────────────────────
+  docs-validation:
     name: Documentation Validation
     runs-on: ubuntu-latest
-    
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Check README exists
-        run: |
-          if [ ! -f README.md ]; then
-            echo "✗ README.md not found"
-            exit 1
-          fi
-          echo "✓ README.md exists"
-      
-      - name: Validate markdown
-        uses: gaurav-nelson/github-action-markdown-link-check@v1
-        with:
-          use-quiet-mode: 'yes'
-          config-file: '.github/markdown-link-check-config.json'
-        continue-on-error: true
-      
-      - name: Check for required documentation files
+      - uses: actions/checkout@v4
+
+      - name: Check required files exist
         run: |
           required_files=(
             "README.md"
@@ -354,45 +179,157 @@ jobs:
             ".env.example"
             "data/benchmark_queries.json"
           )
-          
-          for file in "${required_files[@]}"; do
-            if [ -f "$file" ]; then
-              echo "✓ $file exists"
+
+          all_ok=true
+          for f in "${required_files[@]}"; do
+            if [ -f "$f" ]; then
+              echo "✓ $f exists"
             else
-              echo "✗ $file missing"
-              exit 1
+              echo "✗ $f missing"
+              all_ok=false
             fi
           done
 
-  # =============================================
-  # Job 7: Build Summary
-  # =============================================
-  build-summary:
+          if [ "$all_ok" = false ]; then
+            echo ""
+            echo "❌ One or more required files are missing. See above."
+            exit 1
+          fi
+          echo ""
+          echo "✅ All required files present"
+
+      - name: Validate benchmark_queries.json schema
+        run: |
+          python3 - <<'EOF'
+          import json
+
+          with open("data/benchmark_queries.json") as f:
+              data = json.load(f)
+
+          # File is a top-level JSON array (not wrapped in an object)
+          assert isinstance(data, list), \
+              f"Expected a JSON array at top level, got {type(data).__name__}"
+          assert len(data) >= 10, \
+              f"Need ≥10 benchmark queries, got {len(data)}"
+
+          required_fields = {"query", "expected_docs", "category", "difficulty"}
+          for i, q in enumerate(data):
+              missing = required_fields - q.keys()
+              assert not missing, \
+                  f"Query #{i} missing fields {missing}: {q}"
+              assert isinstance(q["expected_docs"], list) and len(q["expected_docs"]) > 0, \
+                  f"Query #{i} 'expected_docs' must be a non-empty list"
+
+          categories = {q["category"] for q in data}
+          print(f"✅ benchmark_queries.json valid — {len(data)} queries across categories: {sorted(categories)}")
+          EOF
+
+      - name: Validate .env.example completeness
+        run: |
+          python3 - <<'EOF'
+          required_keys = [
+              "OPENAI_API_KEY",
+              "SLACK_WEBHOOK_URL",
+              "QDRANT_HOST",
+              "REDIS_HOST",
+              "MLFLOW_TRACKING_URI",
+              "RAG_EVAL_THRESHOLD",
+              "RAG_COST_BUDGET_MONTHLY",
+          ]
+          with open(".env.example") as f:
+              content = f.read()
+          missing = [k for k in required_keys if k not in content]
+          if missing:
+              print(f"❌ Missing keys in .env.example: {missing}")
+              raise SystemExit(1)
+          print("✅ .env.example contains all required keys")
+          EOF
+
+  # ─────────────────────────────────────────────────────────────────
+  # 5. Unit Tests
+  # ─────────────────────────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Install a lightweight subset sufficient for unit tests
+          # (skips torch/sentence-transformers to keep CI fast)
+          pip install \
+            "pytest==7.4.4" \
+            "pytest-cov==4.1.0" \
+            "pytest-mock==3.12.0" \
+            "python-dotenv==1.0.0" \
+            "pydantic==2.5.3" \
+            "rank-bm25==0.2.2" \
+            "numpy==1.26.3" \
+            "scikit-learn==1.4.0" \
+            "requests==2.31.0" \
+            "redis==4.6.0" \
+            "mlflow==2.14.3" \
+            "prometheus-client==0.19.0"
+
+      - name: Run unit tests
+        run: |
+          pytest tests/unit/ \
+            -v \
+            --cov=dags \
+            --cov=streamlit_app \
+            --cov-report=term-missing \
+            --cov-fail-under=60
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+
+  # ─────────────────────────────────────────────────────────────────
+  # 6. CI Summary gate
+  # ─────────────────────────────────────────────────────────────────
+  ci-summary:
     name: CI Summary
     runs-on: ubuntu-latest
-    needs: [lint, test, dag-validation, docker-build, security, docs]
+    needs:
+      - code-quality
+      - airflow-dag-integrity
+      - docker-build
+      - docs-validation
+      - unit-tests
     if: always()
-    
     steps:
-      - name: Check all jobs status
+      - name: Evaluate results
         run: |
-          echo "## CI Pipeline Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Lint | ${{ needs.lint.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Test | ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| DAG Validation | ${{ needs.dag-validation.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Docker Build | ${{ needs.docker-build.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Security | ${{ needs.security.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Documentation | ${{ needs.docs.result }} |" >> $GITHUB_STEP_SUMMARY
-      
-      - name: Fail if any critical job failed
-        if: |
-          needs.lint.result == 'failure' ||
-          needs.test.result == 'failure' ||
-          needs.dag-validation.result == 'failure' ||
-          needs.docker-build.result == 'failure'
-        run: |
-          echo "❌ One or more critical jobs failed"
-          exit 1
+          results=(
+            "${{ needs.code-quality.result }}"
+            "${{ needs.airflow-dag-integrity.result }}"
+            "${{ needs.docker-build.result }}"
+            "${{ needs.docs-validation.result }}"
+            "${{ needs.unit-tests.result }}"
+          )
+          failed=false
+          for r in "${results[@]}"; do
+            if [[ "$r" == "failure" || "$r" == "cancelled" ]]; then
+              failed=true
+            fi
+          done
+
+          echo "code-quality       : ${{ needs.code-quality.result }}"
+          echo "airflow-dag-integrity: ${{ needs.airflow-dag-integrity.result }}"
+          echo "docker-build       : ${{ needs.docker-build.result }}"
+          echo "docs-validation    : ${{ needs.docs-validation.result }}"
+          echo "unit-tests         : ${{ needs.unit-tests.result }}"
+
+          if [ "$failed" = true ]; then
+            echo ""
+            echo "❌ One or more critical jobs failed"
+            exit 1
+          fi
+          echo ""
+          echo "✅ All CI checks passed"

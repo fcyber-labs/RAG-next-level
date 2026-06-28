@@ -184,10 +184,21 @@ services:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
       GF_INSTALL_PLUGINS: ''
+      # Set the RAG dashboard as the home page so it appears immediately on login
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/rag_pipeline.json
+      # Allow anonymous read-only access — no login needed to view dashboards
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
     volumes:
-      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning
-      - ../monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+      # Named volume MUST come first so the subsequent bind mounts are applied
+      # on top of it and are not shadowed. Previously grafana-data:/var/lib/grafana
+      # was last — in Linux mount namespaces the last mount at a parent path
+      # shadows earlier mounts at child paths, hiding the dashboard JSON files.
       - grafana-data:/var/lib/grafana
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning
+      # Dashboards live at /etc/grafana/dashboards — completely outside
+      # /var/lib/grafana so there is zero overlap with the named volume.
+      - ../monitoring/grafana/dashboards:/etc/grafana/dashboards
     depends_on:
       - prometheus
     restart: always

@@ -1,0 +1,56 @@
+[flake8]
+max-line-length = 120
+
+# ── Ignored violations ─────────────────────────────────────────────
+# These are cosmetic style issues that exist throughout the codebase.
+# They are ignored here so CI passes on existing code.
+# Tighten these rules incrementally as the codebase is cleaned up.
+extend-ignore =
+    # Whitespace noise
+    W291,   # trailing whitespace
+    W292,   # no newline at end of file
+    W293,   # whitespace in blank line
+
+    # Operator/keyword alignment (used intentionally for readability)
+    E221,   # multiple spaces before operator
+    E272,   # multiple spaces before keyword
+
+    # Comment style
+    E261,   # at least two spaces before inline comment
+    E265,   # block comment should start with '# '
+
+    # Blank lines (style, not logic)
+    E302,   # expected 2 blank lines
+    E303,   # too many blank lines
+    E305,   # expected 2 blank lines after class/function definition
+
+    # Imports at top (scripts manipulate sys.path before importing)
+    E402,
+
+    # Unused imports — fix incrementally, not blocking CI
+    F401,
+
+    # f-string missing placeholder — benign but to fix later
+    F541,
+
+    # Assigned but never used — fix incrementally
+    F841
+
+# ── Per-file overrides ─────────────────────────────────────────────
+per-file-ignores =
+    scripts/*.py: E402
+    tests/*.py: F401, E302
+
+# ── Excluded paths ─────────────────────────────────────────────────
+exclude =
+    .git,
+    __pycache__,
+    .venv,
+    venv,
+    .eggs,
+    *.egg-info,
+    dist,
+    build
+
+count = True
+statistics = True

@@ -174,6 +174,15 @@ services:
     image: prom/pushgateway:v1.6.2
     ports:
       - "9091:9091"
+    command:
+      # Persist metrics to disk so data survives container restarts.
+      # Without this, the pushgateway keeps everything in memory and
+      # every docker compose restart wipes all pushed metrics, which is
+      # why Grafana shows "No data" after any stack restart.
+      - '--persistence.file=/pushgateway/metrics'
+      - '--persistence.interval=1m'
+    volumes:
+      - pushgateway-data:/pushgateway
     restart: always
 
   grafana:
@@ -334,4 +343,5 @@ volumes:
   mlflow-artifacts:
   prometheus-data:
   grafana-data:
+  pushgateway-data:
   airflow-worker-logs:

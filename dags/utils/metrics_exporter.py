@@ -167,13 +167,13 @@ def _auto_push() -> None:
 
     Called automatically after every export_* call so metrics always reach
     Prometheus without requiring each task to explicitly call push_metrics().
-    Failures are silently swallowed — Prometheus being down must NEVER block
-    an Airflow task from completing.
+    Failures are logged at WARNING — visible in Airflow task logs — but never
+    raised, so a Pushgateway outage never blocks a pipeline task from completing.
     """
     try:
         push_to_gateway(PUSHGATEWAY_URL, job='rag_pipeline', registry=registry)
     except Exception as e:
-        logger.debug(f"Pushgateway push failed (non-fatal): {e}")
+        logger.warning(f"Pushgateway push failed (metrics not recorded): {e}")
 
 
 def export_counter(metric_name: str, value: float):

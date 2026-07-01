@@ -6,20 +6,19 @@ lightweight unit-test environment, plus sys.path setup so imports work
 both locally and in CI.
 
 KEY FIXES in this version:
-  1. dags/ is added to sys.path (not just repo root) so DAG files can do
-     `from tasks.extract import ...` — this is how Airflow resolves them
-     at runtime, and test_dag_integrity.py needs the same behavior.
-  2. tiktoken stub uses UTF-8 byte encode/decode instead of word-splitting.
-     This makes decode(encode(text)) == text EXACTLY (byte-perfect
-     round-trip), which test_very_short_text requires. The old word-based
-     stub broke this: decode(['0','1']) != 'Short text.'
-  3. torch is NOT stubbed. Stubbing it as a plain MagicMock makes
-     `sys.modules['torch'].Tensor` a MagicMock instance instead of a
-     real class, which crashes scipy's `issubclass(ndarray, Tensor)`
-     check with `TypeError: issubclass() arg 2 must be a class`.
-     Not stubbing torch means `sys.modules['torch']` raises KeyError,
-     which scipy already handles safely (returns False).
-  4. pypdf added to the stub list — dags/tasks/extract.py imports it.
+  1. tenacity.retry is now a REAL passthrough decorator, not a generic
+     MagicMock. A generic MagicMock stub silently replaces the decorated
+     function's entire body with a mock object — e.g.
+     dags/tasks/embed.py's `@retry(...)` on `_get_openai_embeddings` would
+     destroy the function, so its `from openai import OpenAI` line never
+     even executes. The passthrough decorator preserves the real function.
+  2. tiktoken stub uses UTF-8 byte encode/decode — exactly invertible,
+     so decode(encode(text)) == text.
+  3. torch is NOT stubbed — see reasoning below (prevents a scipy/sklearn
+     issubclass() crash when the real scikit-learn package is installed).
+  4. dags/ is on sys.path (not just repo root) so `from tasks.xxx import`
+     and `from utils.xxx import` — used throughout dags/tasks/*.py —
+     resolve exactly like they do when Airflow loads the DAG folder.
 """
 
 import os
@@ -73,14 +72,8 @@ def _plain_stub(name: str) -> MagicMock:
 
 
 def _make_tiktoken_stub() -> MagicMock:
-    """UTF-8 byte-based encode/decode — exactly invertible.
-
-    decode(encode(text)) == text for ANY text, which is required by
-    test_very_short_text (asserts chunks[0] == original text exactly).
-    Token count also scales with text length like a real tokenizer would.
-    """
+    """UTF-8 byte-based encode/decode — exactly invertible."""
     stub = _plain_stub("tiktoken")
-
     enc = MagicMock()
 
     def _encode(text, *a, **kw):
@@ -91,18 +84,45 @@ def _make_tiktoken_stub() -> MagicMock:
 
     enc.encode.side_effect = _encode
     enc.decode.side_effect = _decode
-
     stub.get_encoding.return_value = enc
     stub.encoding_for_model.return_value = enc
     return stub
 
 
+def _make_tenacity_stub() -> MagicMock:
+    """@retry(...) must be a REAL passthrough decorator (see module docstring).
+
+    stop_after_attempt / wait_exponential are only ever passed as kwargs
+    to retry() and never called directly by our code, so they can stay as
+    no-op callables that accept anything and return None.
+    """
+    stub = _plain_stub("tenacity")
+
+    def _retry(*decorator_args, **decorator_kwargs):
+        def _decorator(func):
+            return func  # preserve the real function, unlike a MagicMock
+        return _decorator
+
+    stub.retry = _retry
+    stub.stop_after_attempt = lambda *a, **kw: None
+    stub.wait_exponential = lambda *a, **kw: None
+    stub.wait_fixed = lambda *a, **kw: None
+    stub.wait_random = lambda *a, **kw: None
+    return stub
+
+
 # ── 5. Stub registry ──────────────────────────────────────────────────────────
-# NOTE: torch / torch.nn deliberately NOT included — see module docstring.
+# NOTE: torch / torch.nn deliberately NOT included. Stubbing torch as a
+# plain MagicMock makes sys.modules['torch'].Tensor a MagicMock instance
+# rather than a real class. scipy's is_torch_array() then calls
+# issubclass(numpy.ndarray, Tensor) and crashes with:
+#   TypeError: issubclass() arg 2 must be a class, a tuple of classes...
+# Not stubbing torch means sys.modules['torch'] raises KeyError, which
+# scipy already handles safely (returns False). Verified empirically.
 _STUBS = {
     "tiktoken": _make_tiktoken_stub(),
-    "tenacity": _plain_stub("tenacity"),
-    "pypdf": _plain_stub("pypdf"),                     # extract.py needs this
+    "tenacity": _make_tenacity_stub(),
+    "pypdf": _plain_stub("pypdf"),
     "qdrant_client": _plain_stub("qdrant_client"),
     "qdrant_client.models": _plain_stub("qdrant_client.models"),
     "qdrant_client.http": _plain_stub("qdrant_client.http"),

@@ -5,7 +5,10 @@ Tracks pipeline metrics: docs, chunks, latency, scores.
 
 import logging
 import os
-from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, push_to_gateway
+from prometheus_client import (
+    CollectorRegistry, Counter, Gauge, Histogram,
+    push_to_gateway, pushadd_to_gateway,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -167,11 +170,45 @@ def _auto_push() -> None:
 
     Called automatically after every export_* call so metrics always reach
     Prometheus without requiring each task to explicitly call push_metrics().
-    Failures are logged at WARNING — visible in Airflow task logs — but never
-    raised, so a Pushgateway outage never blocks a pipeline task from completing.
+
+    CRITICAL — grouping_key is required here:
+    Every Airflow task runs in its own separate OS process (LocalExecutor
+    spawns a fresh Python interpreter per task — see "Started process NNNN
+    to run task" in task logs). That means every task re-imports this
+    module from scratch, creating a brand-new CollectorRegistry containing
+    ALL metric objects (Counters, Gauges, Histograms) at their zero-value
+    defaults — prometheus_client always exposes every registered metric,
+    even ones that were never touched in that process.
+
+    push_to_gateway/pushadd_to_gateway both overwrite every metric FAMILY
+    present in the pushed registry for a given (job, grouping_key). Since
+    every task's registry always contains every metric family (mostly at
+    0, plus whatever that task actually set), pushing WITHOUT a
+    distinguishing grouping_key means each task in a pipeline run
+    overwrites ALL previous tasks' metrics back to their zero defaults —
+    by the end of a full DAG run, the pushgateway only reflects whichever
+    task pushed LAST, and everything else silently reads as 0 / "No data"
+    in Grafana. This was the actual cause of every panel showing "No data"
+    even after successful, fully-completed pipeline runs.
+
+    Fix: give each task its own grouping_key based on its Airflow task_id
+    (Airflow injects AIRFLOW_CTX_TASK_ID into every task's environment
+    automatically — no caller changes needed). Each task now owns its own
+    exclusive series in the pushgateway and can no longer clobber another
+    task's metrics. Grafana queries must aggregate with sum(...) across
+    the resulting task_id label — see rag_pipeline.json.
+
+    Failures are logged at WARNING — visible in Airflow task logs — but
+    never raised, so a Pushgateway outage never blocks a pipeline task.
     """
     try:
-        push_to_gateway(PUSHGATEWAY_URL, job='rag_pipeline', registry=registry)
+        task_id = os.getenv('AIRFLOW_CTX_TASK_ID', 'unknown_task')
+        pushadd_to_gateway(
+            PUSHGATEWAY_URL,
+            job='rag_pipeline',
+            registry=registry,
+            grouping_key={'task_id': task_id},
+        )
     except Exception as e:
         logger.warning(f"Pushgateway push failed (metrics not recorded): {e}")
 
@@ -278,12 +315,17 @@ def push_metrics():
     """
     Push all metrics to Prometheus Pushgateway.
     Call this at the end of a task to send metrics.
+
+    Uses the same per-task grouping_key as _auto_push() — see that
+    function's docstring for why this is required.
     """
     try:
-        push_to_gateway(
+        task_id = os.getenv('AIRFLOW_CTX_TASK_ID', 'unknown_task')
+        pushadd_to_gateway(
             PUSHGATEWAY_URL,
             job='rag_pipeline',
-            registry=registry
+            registry=registry,
+            grouping_key={'task_id': task_id},
         )
         logger.info("Pushed metrics to Prometheus Pushgateway")
     

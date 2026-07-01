@@ -1,26 +1,38 @@
 """
 tests/conftest.py
 
-Two jobs this file does:
-  1. Add repo root to sys.path so `from dags.xxx import yyy` works when
-     running `pytest tests/` locally without PYTHONPATH set.
-  2. Stub every heavy package (tiktoken, qdrant_client, groq, …) as
-     MagicMock BEFORE any test module is imported so collection doesn't fail.
+Stubs for heavy ML/infrastructure packages not installed in the
+lightweight unit-test environment, plus sys.path setup so imports work
+both locally and in CI.
 
-Key fix vs previous version:
-  - tiktoken.get_encoding().encode() now returns a real list of ints
-    proportional to the text length so _split_text_into_chunks() works.
-  - MagicMock default for __len__ is 0, which broke every chunker test.
+KEY FIXES in this version:
+  1. dags/ is added to sys.path (not just repo root) so DAG files can do
+     `from tasks.extract import ...` — this is how Airflow resolves them
+     at runtime, and test_dag_integrity.py needs the same behavior.
+  2. tiktoken stub uses UTF-8 byte encode/decode instead of word-splitting.
+     This makes decode(encode(text)) == text EXACTLY (byte-perfect
+     round-trip), which test_very_short_text requires. The old word-based
+     stub broke this: decode(['0','1']) != 'Short text.'
+  3. torch is NOT stubbed. Stubbing it as a plain MagicMock makes
+     `sys.modules['torch'].Tensor` a MagicMock instance instead of a
+     real class, which crashes scipy's `issubclass(ndarray, Tensor)`
+     check with `TypeError: issubclass() arg 2 must be a class`.
+     Not stubbing torch means `sys.modules['torch']` raises KeyError,
+     which scipy already handles safely (returns False).
+  4. pypdf added to the stub list — dags/tasks/extract.py imports it.
 """
 
 import os
 import sys
 from unittest.mock import MagicMock
 
-# ── 1. Repo root on sys.path (fixes local "No module named 'dags'") ─────────
+# ── 1. sys.path setup ────────────────────────────────────────────────────────
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+_DAGS_DIR = os.path.join(_REPO_ROOT, "dags")
+
+for _p in (_REPO_ROOT, _DAGS_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 # ── 2. Airflow env ────────────────────────────────────────────────────────────
 os.environ.setdefault("AIRFLOW_HOME", "/tmp/airflow_test")
@@ -31,7 +43,7 @@ os.environ.setdefault(
 os.environ.setdefault("AIRFLOW__CORE__LOAD_EXAMPLES", "false")
 os.environ.setdefault("AIRFLOW__CORE__UNIT_TEST_MODE", "true")
 
-# ── 3. SQLAlchemy 2.x compat patch (Airflow 2.8.1 passes encoding= kwarg) ───
+# ── 3. SQLAlchemy 2.x compat patch (Airflow 2.8.1 passes encoding= kwarg) ────
 try:
     import sqlalchemy
     _orig_create_engine = sqlalchemy.create_engine
@@ -50,31 +62,9 @@ except ImportError:
     pass
 
 
-# ── 4. Tiktoken — needs a SMART stub ─────────────────────────────────────────
-# Default MagicMock.__len__ returns 0, so chunk.py's token-counting loop
-# never enters and _split_text_into_chunks() returns [].
-# Fix: encode(text) must return a real list whose len() equals word count.
-def _make_tiktoken_stub():
-    stub = MagicMock()
-    stub.__name__ = "tiktoken"
-    stub.__path__ = []
-    stub.__spec__ = None
+# ── 4. Package stub helpers ──────────────────────────────────────────────────
 
-    enc = MagicMock()
-    # one int per whitespace-delimited word — close enough for chunk tests
-    enc.encode.side_effect = (
-        lambda text, *a, **kw: list(range(max(1, len(str(text).split()))))
-    )
-    enc.decode.side_effect = lambda tokens: " ".join(str(t) for t in tokens)
-    enc.__len__ = lambda self: 100_000  # vocab size, not used in tests
-
-    stub.get_encoding.return_value = enc
-    stub.encoding_for_model.return_value = enc
-    return stub
-
-
-# ── 5. All heavy package stubs ───────────────────────────────────────────────
-def _plain_stub(name):
+def _plain_stub(name: str) -> MagicMock:
     s = MagicMock()
     s.__name__ = name
     s.__path__ = []
@@ -82,9 +72,37 @@ def _plain_stub(name):
     return s
 
 
+def _make_tiktoken_stub() -> MagicMock:
+    """UTF-8 byte-based encode/decode — exactly invertible.
+
+    decode(encode(text)) == text for ANY text, which is required by
+    test_very_short_text (asserts chunks[0] == original text exactly).
+    Token count also scales with text length like a real tokenizer would.
+    """
+    stub = _plain_stub("tiktoken")
+
+    enc = MagicMock()
+
+    def _encode(text, *a, **kw):
+        return list(str(text).encode("utf-8"))
+
+    def _decode(tokens, *a, **kw):
+        return bytes(tokens).decode("utf-8", errors="ignore")
+
+    enc.encode.side_effect = _encode
+    enc.decode.side_effect = _decode
+
+    stub.get_encoding.return_value = enc
+    stub.encoding_for_model.return_value = enc
+    return stub
+
+
+# ── 5. Stub registry ──────────────────────────────────────────────────────────
+# NOTE: torch / torch.nn deliberately NOT included — see module docstring.
 _STUBS = {
-    "tiktoken": _make_tiktoken_stub(),          # smart stub — see above
+    "tiktoken": _make_tiktoken_stub(),
     "tenacity": _plain_stub("tenacity"),
+    "pypdf": _plain_stub("pypdf"),                     # extract.py needs this
     "qdrant_client": _plain_stub("qdrant_client"),
     "qdrant_client.models": _plain_stub("qdrant_client.models"),
     "qdrant_client.http": _plain_stub("qdrant_client.http"),
@@ -92,8 +110,6 @@ _STUBS = {
     "qdrant_client.http.exceptions": _plain_stub("qdrant_client.http.exceptions"),
     "groq": _plain_stub("groq"),
     "sentence_transformers": _plain_stub("sentence_transformers"),
-    "torch": _plain_stub("torch"),
-    "torch.nn": _plain_stub("torch.nn"),
     "transformers": _plain_stub("transformers"),
     "openai": _plain_stub("openai"),
     "langchain": _plain_stub("langchain"),

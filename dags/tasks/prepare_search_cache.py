@@ -53,6 +53,20 @@ def prepare_search_cache(
 
     logger.info(f"[prepare_search_cache] Starting cache warm-up for '{collection_name}'")
 
+    # Guard: on the very first pipeline run (before any upsert has ever
+    # succeeded) the collection may not exist yet. Check explicitly instead
+    # of letting client.scroll() raise a 404 that gets logged as a scary
+    # ERROR — this is an expected, recoverable state, not a real failure.
+    try:
+        client.get_collection(collection_name)
+    except Exception:
+        logger.info(
+            f"[prepare_search_cache] Collection '{collection_name}' does not "
+            f"exist yet — nothing to warm. This is expected before the first "
+            f"successful upsert_vectors run."
+        )
+        return {'success': True, 'collection_name': collection_name, 'chunks_cached': 0}
+
     # ── 1. Scroll all chunks with full payload ──────────────────────────────
     all_chunks = []
     offset     = None

@@ -129,10 +129,15 @@ def upsert_to_qdrant(
         )
         points.append(point)
     
-    # Upsert in batches
-    points_upserted = 0
+    # Upsert in batches — track which source chunks actually succeeded
+    # (not just a count) so Phase 2 hash confirmation below only confirms
+    # documents whose chunks really landed in Qdrant, even if some batches
+    # fail partway through.
+    points_upserted   = 0
+    succeeded_chunks  = []
     for i in range(0, len(points), batch_size):
-        batch = points[i:i + batch_size]
+        batch       = points[i:i + batch_size]
+        chunk_batch = embedded_chunks[i:i + batch_size]
         
         try:
             client.upsert(
@@ -140,6 +145,7 @@ def upsert_to_qdrant(
                 points=batch,
             )
             points_upserted += len(batch)
+            succeeded_chunks.extend(chunk_batch)
             logger.debug(f"Upserted batch {i//batch_size + 1}/{(len(points)-1)//batch_size + 1}")
         
         except Exception as e:
@@ -167,6 +173,45 @@ def upsert_to_qdrant(
     export_counter('vectors_upserted_total', points_upserted)
     export_histogram('upsert_latency_seconds', elapsed_time)
     export_gauge('collection_total_points', total_points)
+
+    # ── PHASE 2 — confirm document hashes in Redis ──────────────────────────
+    # This is the write half of the two-phase dedup design (see hash_store.py
+    # and deduplicate.py docstrings). deduplicate.py only ever READS
+    # document_hash_exists() — it never writes. The write happens here,
+    # and ONLY for documents whose chunks actually made it into Qdrant in
+    # this batch, so a crash earlier in the pipeline never causes a
+    # "ghost duplicate" that gets skipped forever.
+    if points_upserted > 0:
+        try:
+            from utils.hash_store import confirm_document_hash
+
+            # A single source document can produce many chunks; confirm
+            # each unique content_hash once, not once per chunk. Only
+            # chunks whose batch actually succeeded are considered.
+            confirmed_hashes = set()
+            for chunk in succeeded_chunks:
+                content_hash = chunk.get('content_hash')
+                if not content_hash or content_hash in confirmed_hashes:
+                    continue
+                confirm_document_hash(
+                    content_hash=content_hash,
+                    metadata={
+                        'filename':   chunk.get('filename', ''),
+                        'source':     chunk.get('source', ''),
+                        'source_uri': chunk.get('source_uri', ''),
+                        'confirmed_at': datetime.now().isoformat(),
+                    },
+                )
+                confirmed_hashes.add(content_hash)
+            if confirmed_hashes:
+                logger.info(
+                    f"Confirmed {len(confirmed_hashes)} document hashes in Redis "
+                    f"after successful upsert"
+                )
+        except Exception as e:
+            # Non-fatal: dedup working correctly next run is nice-to-have,
+            # not a reason to fail an otherwise-successful upsert.
+            logger.warning(f"Could not confirm document hashes in Redis: {e}")
 
     # Invalidate the Streamlit app's Redis-cached BM25 chunk list and any
     # cached LLM answers for this collection — it just changed, so both

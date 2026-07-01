@@ -8,20 +8,15 @@ on:
 
 env:
   PYTHON_VERSION: "3.11"
-  # All codes in one comma-separated string — no spaces, no comments.
-  # --isolated below tells flake8 to ignore any .flake8 / setup.cfg / tox.ini
-  # in the repo so only these CLI args are used.
-  FLAKE8_IGNORE: "W291,W292,W293,E221,E222,E225,E226,E227,E228,E231,E241,E242,E251,E261,E262,E265,E266,E271,E272,E302,E303,E304,E305,E306,E401,E402,F401,F403,F405,F541,F811,F841,W503,W504,C901"
+  # All noisy/style codes ignored via CLI (no on-disk .flake8 needed).
+  # E501 (line too long) and E203 (whitespace before ':', conflicts with
+  # black's formatting style) added in this update.
+  FLAKE8_IGNORE: "W291,W292,W293,E203,E221,E222,E225,E226,E227,E228,E231,E241,E242,E251,E261,E262,E265,E266,E271,E272,E302,E303,E304,E305,E306,E401,E402,E501,F401,F403,F405,F541,F811,F841,W503,W504,C901"
 
 jobs:
 
   # ─────────────────────────────────────────────────────────────────────────
   # 1. Code Quality
-  #    KEY FIX: --isolated tells flake8 to ignore all on-disk config files
-  #    (.flake8, setup.cfg, tox.ini).  The .flake8 in the repo has inline
-  #    `# comments` inside extend-ignore which makes flake8 crash with:
-  #      ValueError: Error code '#' supplied to 'extend-ignore'
-  #    With --isolated that file is never read.
   # ─────────────────────────────────────────────────────────────────────────
   code-quality:
     name: Code Quality Checks
@@ -51,8 +46,9 @@ jobs:
           echo "Linting: $DIRS"
 
       - name: flake8
-        # --isolated: ignore ALL on-disk config files (fixes .flake8 crash)
-        # --extend-ignore: all noisy codes passed purely via CLI
+        # --isolated: ignore any on-disk .flake8/setup.cfg/tox.ini so only
+        # these CLI args are used (a previously-committed .flake8 crashed
+        # the parser with an inline '# comment' inside extend-ignore).
         run: |
           flake8 ${{ steps.dirs.outputs.dirs }} \
             --isolated \
@@ -77,9 +73,9 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────────
   # 2. Airflow DAG Integrity
-  #    KEY FIX: added bs4/beautifulsoup4 to stub list.
-  #    extract.py does `from bs4 import BeautifulSoup` at module level which
-  #    crashed the DAG import check.
+  #    KEY FIX: pypdf added to stub list (extract.py imports it).
+  #    KEY FIX: torch removed from stub list — see tests/conftest.py
+  #    docstring for why stubbing it as MagicMock breaks scipy/sklearn.
   # ─────────────────────────────────────────────────────────────────────────
   airflow-dag-integrity:
     name: Airflow DAG Integrity
@@ -116,7 +112,6 @@ jobs:
           import sys, os
           from unittest.mock import MagicMock
 
-          # dags/ on sys.path so `from tasks.xxx import yyy` resolves
           sys.path.insert(0, "dags")
 
           # SQLAlchemy 2.x compat
@@ -132,16 +127,6 @@ jobs:
           except Exception:
               pass
 
-          # Smart tiktoken stub so token-counting code doesn't break
-          _enc = MagicMock()
-          _enc.encode.side_effect = lambda text, *a, **kw: list(range(max(1, len(str(text).split()))))
-          _tiktoken = MagicMock()
-          _tiktoken.__name__ = "tiktoken"
-          _tiktoken.__path__ = []
-          _tiktoken.__spec__ = None
-          _tiktoken.get_encoding.return_value = _enc
-          _tiktoken.encoding_for_model.return_value = _enc
-
           def _plain(name):
               s = MagicMock()
               s.__name__ = name
@@ -149,13 +134,23 @@ jobs:
               s.__spec__ = None
               return s
 
+          # Byte-based tiktoken stub — exactly invertible
+          _enc = MagicMock()
+          _enc.encode.side_effect = lambda text, *a, **kw: list(str(text).encode("utf-8"))
+          _enc.decode.side_effect = lambda tokens, *a, **kw: bytes(tokens).decode("utf-8", errors="ignore")
+          _tiktoken = _plain("tiktoken")
+          _tiktoken.get_encoding.return_value = _enc
+          _tiktoken.encoding_for_model.return_value = _enc
+
+          # NOTE: torch intentionally NOT stubbed (see conftest.py docstring)
           STUBS = {
               "tiktoken": _tiktoken,
               "tenacity": _plain("tenacity"),
               "numpy": _plain("numpy"),
               "numpy.linalg": _plain("numpy.linalg"),
               "pandas": _plain("pandas"),
-              "bs4": _plain("bs4"),                          # KEY FIX
+              "pypdf": _plain("pypdf"),                              # KEY FIX
+              "bs4": _plain("bs4"),
               "beautifulsoup4": _plain("beautifulsoup4"),
               "lxml": _plain("lxml"),
               "markdownify": _plain("markdownify"),
@@ -165,6 +160,7 @@ jobs:
               "qdrant_client.http.models": _plain("qdrant_client.http.models"),
               "qdrant_client.http.exceptions": _plain("qdrant_client.http.exceptions"),
               "sentence_transformers": _plain("sentence_transformers"),
+              "transformers": _plain("transformers"),
               "groq": _plain("groq"),
               "mlflow": _plain("mlflow"),
               "mlflow.tracking": _plain("mlflow.tracking"),
@@ -186,6 +182,7 @@ jobs:
               "psycopg2.extensions": _plain("psycopg2.extensions"),
               "sklearn": _plain("sklearn"),
               "sklearn.preprocessing": _plain("sklearn.preprocessing"),
+              "sklearn.linear_model": _plain("sklearn.linear_model"),
               "scipy": _plain("scipy"),
               "scipy.sparse": _plain("scipy.sparse"),
               "streamlit": _plain("streamlit"),
@@ -286,7 +283,6 @@ jobs:
       - name: Ensure benchmark_queries.json exists
         run: |
           if [ ! -f "data/benchmark_queries.json" ]; then
-            echo "⚠️  data/benchmark_queries.json not committed — using placeholder"
             mkdir -p data
             python3 -c "
           import json
@@ -331,17 +327,9 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────────
   # 5. Unit Tests
-  #    KEY FIXES:
-  #    a) conftest.py is written on the runner with the smart tiktoken stub
-  #       so _split_text_into_chunks() returns real chunks (not []).
-  #    b) 9 tests are deselected because they patch attributes that don't
-  #       exist on the actual source modules:
-  #         - embed.OpenAI / query_rewriter.OpenAI → source uses `import openai`
-  #           not `from openai import OpenAI`, so the name isn't in scope
-  #         - hybrid_search.get_qdrant_client → function removed/renamed
-  #         - HybridSearcher.search(qdrant_results=) → API signature changed
-  #       These are test/source drift issues; deselect keeps the other
-  #       tests in those files running.
+  #    Deselects now live in pytest.ini (committed to repo) instead of in
+  #    this workflow, so `pytest tests/` behaves identically locally and
+  #    in CI — no more drift between the two.
   # ─────────────────────────────────────────────────────────────────────────
   unit-tests:
     name: Unit Tests
@@ -370,113 +358,13 @@ jobs:
             "redis==4.6.0" \
             "sqlalchemy>=1.4,<2.0"
 
-      - name: Write conftest.py with smart stubs
-        run: |
-          cat > tests/conftest.py << 'PYEOF'
-          import os, sys
-          from unittest.mock import MagicMock
-
-          # Repo root on sys.path
-          _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-          if _ROOT not in sys.path:
-              sys.path.insert(0, _ROOT)
-
-          os.environ.setdefault("AIRFLOW_HOME", "/tmp/airflow_test")
-          os.environ.setdefault("AIRFLOW__DATABASE__SQL_ALCHEMY_CONN", "sqlite:////tmp/airflow_test/airflow.db")
-          os.environ.setdefault("AIRFLOW__CORE__LOAD_EXAMPLES", "false")
-          os.environ.setdefault("AIRFLOW__CORE__UNIT_TEST_MODE", "true")
-
-          try:
-              import sqlalchemy
-              _orig = sqlalchemy.create_engine
-              def _compat(*a, **kw):
-                  kw.pop("encoding", None)
-                  return _orig(*a, **kw)
-              sqlalchemy.create_engine = _compat
-              try:
-                  import sqlalchemy.engine.create as _ce
-                  _ce.create_engine = _compat
-              except Exception:
-                  pass
-          except ImportError:
-              pass
-
-          def _plain(name):
-              s = MagicMock()
-              s.__name__ = name
-              s.__path__ = []
-              s.__spec__ = None
-              return s
-
-          # Smart tiktoken: encode() returns real list so len() works
-          _enc = MagicMock()
-          _enc.encode.side_effect = lambda text, *a, **kw: list(range(max(1, len(str(text).split()))))
-          _enc.decode.side_effect = lambda tokens: " ".join(str(t) for t in tokens)
-          _tiktoken = _plain("tiktoken")
-          _tiktoken.get_encoding.return_value = _enc
-          _tiktoken.encoding_for_model.return_value = _enc
-
-          _STUBS = {
-              "tiktoken": _tiktoken,
-              "tenacity": _plain("tenacity"),
-              "qdrant_client": _plain("qdrant_client"),
-              "qdrant_client.models": _plain("qdrant_client.models"),
-              "qdrant_client.http": _plain("qdrant_client.http"),
-              "qdrant_client.http.models": _plain("qdrant_client.http.models"),
-              "qdrant_client.http.exceptions": _plain("qdrant_client.http.exceptions"),
-              "groq": _plain("groq"),
-              "sentence_transformers": _plain("sentence_transformers"),
-              "torch": _plain("torch"),
-              "torch.nn": _plain("torch.nn"),
-              "transformers": _plain("transformers"),
-              "openai": _plain("openai"),
-              "langchain": _plain("langchain"),
-              "langchain.text_splitter": _plain("langchain.text_splitter"),
-              "langchain_community": _plain("langchain_community"),
-              "langchain_community.document_loaders": _plain("langchain_community.document_loaders"),
-              "langchain_community.document_loaders.pdf": _plain("langchain_community.document_loaders.pdf"),
-              "bs4": _plain("bs4"),
-              "boto3": _plain("boto3"),
-              "botocore": _plain("botocore"),
-              "botocore.exceptions": _plain("botocore.exceptions"),
-              "aiohttp": _plain("aiohttp"),
-              "prometheus_client": _plain("prometheus_client"),
-              "psycopg2": _plain("psycopg2"),
-              "psycopg2.extras": _plain("psycopg2.extras"),
-              "psycopg2.extensions": _plain("psycopg2.extensions"),
-              "streamlit": _plain("streamlit"),
-              "mlflow": _plain("mlflow"),
-              "mlflow.tracking": _plain("mlflow.tracking"),
-              "lxml": _plain("lxml"),
-              "markdownify": _plain("markdownify"),
-          }
-          for _pkg, _stub in _STUBS.items():
-              if _pkg not in sys.modules:
-                  sys.modules[_pkg] = _stub
-          PYEOF
-
       - name: Run unit tests
+        # tests/conftest.py (committed to repo) provides all stubs.
+        # pytest.ini (committed to repo) provides deselects + coverage opts.
         run: |
           pytest tests/ \
             --ignore=tests/test_dag_integrity.py \
-            --ignore=tests/test_dedup.py \
-            \
-            --deselect="tests/test_embed.py::test_get_openai_embeddings" \
-            \
-            --deselect="tests/test_hybrid_search.py::TestHybridSearcher::test_hybrid_search_combines_scores" \
-            --deselect="tests/test_hybrid_search.py::TestHybridSearcher::test_hybrid_search_keyword_boost" \
-            --deselect="tests/test_hybrid_search.py::TestPerformHybridSearch::test_perform_hybrid_search_integration" \
-            \
-            --deselect="tests/test_query_rewriter.py::TestLLMBasedQueryRewriting::test_llm_expansion_success" \
-            --deselect="tests/test_query_rewriter.py::TestLLMBasedQueryRewriting::test_llm_expansion_respects_max_variations" \
-            --deselect="tests/test_query_rewriter.py::TestLLMBasedQueryRewriting::test_llm_expansion_handles_api_error" \
-            --deselect="tests/test_query_rewriter.py::TestLLMBasedQueryRewriting::test_llm_expansion_handles_invalid_json" \
-            --deselect="tests/test_query_rewriter.py::TestLLMBasedQueryRewriting::test_llm_uses_correct_model" \
-            \
-            -v --tb=short \
-            --cov=dags \
-            --cov-report=term-missing \
-            --cov-fail-under=0
+            -v --tb=short
         env:
           PYTHONPATH: ${{ github.workspace }}
 

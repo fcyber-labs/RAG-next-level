@@ -90,23 +90,34 @@ def document_hash_exists(content_hash: str) -> bool:
     whether a document is a candidate-new document or an already-confirmed
     duplicate.
 
+    Any Redis error (connection refused, timeout, etc.) is caught and
+    treated as "not seen" (returns False) rather than propagating — a
+    Redis outage must never silently drop a document from processing.
+
     Args:
         content_hash: SHA-256 hex string from compute_content_hash().
 
     Returns:
         True  — hash found -> document was previously confirmed stored.
-        False — hash not found -> document is new (or was never confirmed
-                due to a prior failed run) and should be processed.
+        False — hash not found, OR Redis is unreachable -> document should
+                be treated as new and processed.
     """
     client = get_redis_client()
     key = _make_key(content_hash)
-    exists = bool(client.exists(key))
+    try:
+        exists = bool(client.exists(key))
+    except Exception as e:
+        logger.warning(
+            "Redis error checking hash existence, defaulting to False "
+            "(treat as new so the document still gets processed): %s", e
+        )
+        return False
     if exists:
         logger.debug("Hash already confirmed: %s", content_hash[:16])
     return exists
 
 
-def confirm_document_hash(content_hash: str, ttl: int = DEFAULT_TTL) -> None:
+def confirm_document_hash(content_hash: str, metadata: dict = None, ttl: int = DEFAULT_TTL) -> bool:
     """WRITE *content_hash* to Redis. Call ONLY after a confirmed success.
 
     This should only be invoked after the document has been fully
@@ -115,14 +126,35 @@ def confirm_document_hash(content_hash: str, ttl: int = DEFAULT_TTL) -> None:
     document as "seen" when it was never actually stored (a "ghost
     duplicate").
 
+    Uses Redis SET NX so an already-confirmed hash is never overwritten —
+    the operation is idempotent and safe to call more than once for the
+    same document.
+
     Args:
         content_hash: SHA-256 hex string from compute_content_hash().
+        metadata:     Optional dict (e.g. {'filename': ...}) stored
+                      alongside the confirmation, for debugging/audit.
         ttl:          Expiry in seconds (default 30 days).
+
+    Returns:
+        True  — this call newly confirmed the hash (it was not previously
+                confirmed).
+        False — the hash was already confirmed; this call was a no-op.
     """
+    import json
+
     client = get_redis_client()
     key = _make_key(content_hash)
-    client.set(key, "1", ex=ttl)
-    logger.debug("Hash confirmed and stored: %s", content_hash[:16])
+    value = json.dumps(metadata) if metadata else "1"
+
+    was_new = client.set(key, value, ex=ttl, nx=True)
+
+    if was_new:
+        logger.debug("Hash confirmed and stored: %s", content_hash[:16])
+    else:
+        logger.debug("Hash already confirmed (no-op): %s", content_hash[:16])
+
+    return bool(was_new)
 
 
 def delete_document_hash(content_hash: str) -> bool:

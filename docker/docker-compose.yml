@@ -193,9 +193,16 @@ services:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
       GF_INSTALL_PLUGINS: ''
-      # Set the RAG dashboard as the home page so it appears immediately on login
-      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/rag_pipeline.json
-      # Allow anonymous read-only access — no login needed to view dashboards
+      # NOTE: deliberately NOT setting GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH.
+      # That setting loads a dashboard directly from a file path, bypassing
+      # Grafana's normal database-backed dashboard registration. The frontend
+      # still automatically fires an annotations query for the dashboard's
+      # UID on every page load — but since the backend never registered that
+      # UID (it was loaded from disk, not the DB), that query fails with
+      # "Invalid dashboard UID in annotation request". The dashboard is
+      # already reachable normally via the file provisioner below
+      # (dashboards.yml -> /etc/grafana/dashboards), which DOES register it
+      # properly in Grafana's DB — just navigate to Dashboards > RAG.
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
     volumes:
@@ -345,3 +352,5 @@ volumes:
   grafana-data:
   pushgateway-data:
   airflow-worker-logs:
+
+  

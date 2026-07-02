@@ -173,23 +173,20 @@ def _auto_push() -> None:
 
     CRITICAL — grouping_key is required here:
     Every Airflow task runs in its own separate OS process (LocalExecutor
-    spawns a fresh Python interpreter per task — see "Started process NNNN
-    to run task" in task logs). That means every task re-imports this
-    module from scratch, creating a brand-new CollectorRegistry containing
-    ALL metric objects (Counters, Gauges, Histograms) at their zero-value
+    spawns a fresh Python interpreter per task). That means every task
+    re-imports this module from scratch, creating a brand-new
+    CollectorRegistry containing ALL metric objects at their zero-value
     defaults — prometheus_client always exposes every registered metric,
-    even ones that were never touched in that process.
+    even ones never touched in that process.
 
-    push_to_gateway/pushadd_to_gateway both overwrite every metric FAMILY
-    present in the pushed registry for a given (job, grouping_key). Since
-    every task's registry always contains every metric family (mostly at
-    0, plus whatever that task actually set), pushing WITHOUT a
-    distinguishing grouping_key means each task in a pipeline run
-    overwrites ALL previous tasks' metrics back to their zero defaults —
-    by the end of a full DAG run, the pushgateway only reflects whichever
-    task pushed LAST, and everything else silently reads as 0 / "No data"
-    in Grafana. This was the actual cause of every panel showing "No data"
-    even after successful, fully-completed pipeline runs.
+    push_to_gateway overwrites every metric family present in the pushed
+    registry for a given (job, grouping_key) using HTTP PUT. Since every
+    task's registry always contains every metric family (mostly at 0, plus
+    whatever that task actually set), pushing WITHOUT a distinguishing
+    grouping_key means each task in a pipeline run overwrites ALL previous
+    tasks' metrics back to their zero defaults — by the end of a full DAG
+    run, the pushgateway only reflects whichever task pushed LAST, and
+    everything else reads as 0 / "No data" in Grafana.
 
     Fix: give each task its own grouping_key based on its Airflow task_id
     (Airflow injects AIRFLOW_CTX_TASK_ID into every task's environment
